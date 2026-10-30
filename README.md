@@ -1,93 +1,177 @@
 # Merchant Policy RAG Chatbot
 
-A traditional retrieval-augmented generation application for merchant policy
-questions. The Streamlit client sends a question and conversation ID to FastAPI.
-The server keeps bounded, persistent conversation history in SQLite, recalls
-relevant older exchanges for follow-ups, retrieves similar chunks from a
-persistent Chroma vector database, then asks the configured Groq chat model to
-answer from policy chunks and cite their source documents.
+A document-grounded chatbot for answering questions about merchant policies.
+The project was developed in two major updates: first, a basic retrieval-
+augmented generation (RAG) application; then a more capable conversational
+workflow with persistent memory, managed prompts, and latency improvements.
 
-## LangGraph RAG workflow
+This README explains both stages and documents how to configure, run, and
+maintain the current application.
+
+## Development updates
+
+### Update 1: Basic RAG chatbot
+
+The first version established the document question-answering pipeline:
+
+1. **Load policy documents.** Read PDF, DOCX, HTML, and HTM files from
+   `server/data/documents/`. PDF extraction handles text and tables; scanned
+   image-only pages are not OCR-processed.
+2. **Prepare the knowledge base.** Split extracted content into overlapping
+   chunks while preserving source and page metadata. Create embeddings locally
+   with `sentence-transformers/all-MiniLM-L6-v2` and store the chunks and
+   vectors in Chroma.
+3. **Retrieve evidence.** For a question, search the persistent Chroma index
+   for similar policy chunks.
+4. **Generate a grounded response.** Send the question and retrieved excerpts
+   to the configured Groq chat model. Return an answer with source and page
+   citations rather than treating the model's general knowledge as policy.
+
+This version provided the foundation: a local policy index, semantic vector
+search, and answers tied to retrieved policy content.
+
+### Update 2: Agentic memory, prompt management, and faster responses
+
+The second update extended the basic RAG pipeline into a LangGraph workflow
+that can interpret conversation context, decide which processing steps are
+needed, and check its answer before returning it.
+
+- **Persistent conversational memory:** Store exchanges in SQLite, isolated by
+  conversation ID. The workflow loads recent messages and can recall up to
+  three relevant older exchanges to resolve follow-up references. Memory
+  informs the conversation, but is never used as policy evidence.
+- **Prompt management:** Keep prompts for classification, follow-up rewriting,
+  query refinement, evidence assessment, answering, grounding, and social
+  responses in versioned files under `server/prompts/`. `PromptManager` loads
+  the selected prompt set using `PROMPT_VERSION`.
+- **Intent-aware workflow:** Classify messages as policy questions, follow-ups,
+  greetings, or out-of-scope requests. Rewrite follow-ups as standalone
+  retrieval queries using the current conversation's context.
+- **Evidence and grounding checks:** Check whether retrieved policy excerpts
+  are sufficient, then verify the drafted answer's claims and citations.
+  Discard unsupported drafts and return a fixed no-answer response when the
+  available evidence is insufficient or grounding fails.
+- **Bounded query refinement:** If the initial evidence check fails, generate
+  at most two additional search queries and run one refinement pass.
+- **Latency improvements:** Run evidence assessment and answer drafting
+  concurrently, and handle common standalone greetings locally without
+  classification and response-generation calls. These reduce serial work and
+  unnecessary model calls; response times are not benchmarked here.
+- **Conversation controls:** Persist exchanges across API restarts, expose
+  history retrieval and deletion endpoints, and limit retained conversation
+  history.
+
+## Current request workflow
 
 ```text
-PDF / DOCX / HTML files
-    → extract text and tables
-    → split into overlapping chunks with source/page metadata
-    → create local sentence-transformer embeddings
-    → store chunks and vectors in Chroma
+Policy files
+  -> extract text and tables
+  -> split into overlapping chunks with source metadata
+  -> create local sentence-transformer embeddings
+  -> store chunks and vectors in Chroma
 
-Merchant question
-    → recall recent and relevant earlier messages from this conversation
-    → classify as policy, follow-up, greeting, or out-of-scope
-    → rewrite follow-ups using conversation context only
-    → retrieve relevant Chroma chunks
-    → concurrently assess evidence and draft an answer
-    → refine into up to two searches once if needed; discard drafts if evidence is insufficient
-    → verify grounding/citations before returning
-    → return answer, confidence, and source/page citations
+Chat message
+  -> load recent and relevant conversation history
+  -> classify the message
+  -> rewrite follow-ups when needed
+  -> retrieve policy chunks from Chroma
+  -> assess evidence and draft an answer concurrently
+  -> optionally refine retrieval once
+  -> verify evidence and citations
+  -> save the exchange and return answer, confidence, and sources
 ```
 
-Groq is used for text generation. Embeddings are generated locally with
-`sentence-transformers/all-MiniLM-L6-v2`; Groq's chat API is not used for
-embeddings. LangGraph orchestrates classification, follow-up rewriting,
-retrieval, one bounded retrieval-refinement pass, relevance checking, answer
-drafting, grounding verification, and memory updates. Evidence assessment and
-answer drafting run concurrently to reduce serial model latency; drafts are
-discarded unless evidence sufficiency and grounding checks pass. Common
-standalone greetings are handled locally without model calls. The retrieval layer is
-vector-only; graph retrieval, BM25, admin uploads, and an ingestion API are not
-included. Documents are added to the server's documents folder and indexed with
-a command-line script. Named, versioned prompts are stored under
-`server/prompts/v1/` and loaded through the prompt manager. Conversation memories
-can clarify references but are never policy evidence.
-Select the active template set with `PROMPT_VERSION` (default `v1`); add a new
-versioned directory before switching a deployment.
+The Streamlit client sends chat requests to the FastAPI server. LangGraph
+orchestrates the backend steps, SQLite stores conversation history, and Chroma
+stores the policy knowledge base. Groq is used for language-model tasks;
+embeddings are generated locally.
 
-Conversation memory is stored in SQLite and isolated by conversation ID. The
-graph recalls the latest 12 messages plus up to three relevant older exchanges
-from the same conversation, and retains up to 200 exchanges per conversation and
-256 active conversations. Restarting the API does not clear memory. Selecting
-**New conversation** starts a fresh, isolated conversation; deleting a
-conversation removes its saved exchanges. The default database is
-`server/data/memory.sqlite3`; configure `MEMORY_DATABASE_PATH` to select another
-location. For multi-replica deployments, use a shared production database rather
-than a local SQLite file.
+## Features
 
-## 1. Configure Groq
+### Policy knowledge base
 
-From the project root, make the local environment file:
+- Supports PDF, DOCX, HTML, and HTM source files.
+- Extracts PDF text and tables; scanned image-only PDF content requires OCR
+  outside the current pipeline.
+- Preserves document and page metadata for citations.
+- Uses configurable overlapping chunks and local sentence-transformer
+  embeddings.
+- Stores vectors persistently in Chroma and supports reindexing after source
+  files change.
+- Provides document and indexed-chunk inspection through the API.
+
+### Conversational RAG
+
+- Separates policy questions, follow-ups, greetings, and out-of-scope messages.
+- Uses recent history and up to three matching older exchanges to understand
+  follow-ups within the same conversation.
+- Keeps conversation memory separate from policy evidence.
+- Checks whether policy evidence supports an answer and validates grounding and
+  citations before returning it.
+- Performs at most one retrieval refinement pass with up to two additional
+  queries.
+- Returns the configured no-answer response when evidence is missing,
+  insufficient, or fails grounding validation.
+- Returns answer confidence and source/page citations. Confidence is the
+  highest retrieved-chunk similarity for a grounded answer; it is a retrieval
+  score, not a calibrated probability.
+
+### Prompt and response management
+
+- Stores named prompts in versioned directories, currently
+  `server/prompts/v1/`.
+- Selects the prompt directory through `PROMPT_VERSION`.
+- Handles common standalone pleasantries locally; generated social responses
+  are restricted to pleasantries and do not answer factual policy questions.
+
+### Conversation memory
+
+- Persists exchanges in SQLite, isolated by conversation ID.
+- Loads the latest 12 messages and recalls up to three relevant older exchanges.
+- Retains up to 200 exchanges per conversation and 256 active conversations by
+  default.
+- Supports reading and deleting a conversation through the API.
+- Persists across API restarts. A local SQLite file is intended for a
+  single-server deployment; use shared persistent storage for multi-replica
+  deployments.
+
+## Technology stack
+
+| Area | Technology |
+|---|---|
+| User interface | Streamlit |
+| API | FastAPI |
+| Workflow orchestration | LangGraph |
+| Chat model | Groq, configured with `GROQ_MODEL` |
+| Embeddings | Local `sentence-transformers/all-MiniLM-L6-v2` by default |
+| Vector store | Persistent Chroma |
+| Conversation memory | SQLite |
+| Document formats | PDF, DOCX, HTML, HTM |
+
+## Run locally
+
+### 1. Configure the environment
+
+From the project root, copy the example configuration:
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-Open `.env` and enter the API key created in your Groq account:
+Set `GROQ_API_KEY` in `.env` to a key from your Groq account. Do not put
+credentials in source files or commit `.env`. The chat model uses Groq; the
+embedding model runs locally and does not need an embedding API key.
 
-```dotenv
-GROQ_API_KEY=your-groq-api-key
-GROQ_MODEL=openai/gpt-oss-120b
-```
+### 2. Add and index policy documents
 
-Keep the key in this root `.env` file. Do not add it to Python code, the Streamlit
-client, or source control. `.env` is excluded by `.gitignore`. `EMBEDDING_MODEL`
-selects the local embedding model and does not require an embedding API key.
-
-## 2. Put policy files in the data folder
-
-Copy the files you want indexed into:
+Place source files in:
 
 ```text
 server/data/documents/
 ```
 
-Supported types: PDF, DOCX, HTML, and HTM. PDFs are processed by direct text and
-table extraction only; image-only scanned pages are not OCR processed and will
-not contribute searchable text. Keep the original source files in this directory
-so you can rebuild the index later.
-
-## 3. Install and index
-
-Use Python 3.11 or 3.12. From the project root in PowerShell:
+Create a Python environment, install server dependencies, and index the files
+from the project root:
 
 ```powershell
 python -m venv .venv
@@ -98,23 +182,18 @@ $env:PYTHONPATH = "server"
 python -m ingestion.index_documents
 ```
 
-The first indexing run downloads the sentence-transformer model, so it needs
-internet access. The generated Chroma database is stored in
-`server/data/chroma/` by default. Re-run the indexing command after adding,
-removing, or changing source documents; the command updates the collection from
-the files in `server/data/documents/`. The server also automatically indexes
-source files at startup if the Chroma collection is empty.
+The first indexing run downloads the sentence-transformer model and requires
+internet access. The default Chroma database is written to
+`server/data/chroma/`. Re-run the indexing command after adding, changing, or
+removing source documents. If the collection is empty, the API also attempts to
+index the local source files at startup.
 
-To inspect stored chunks, expand a document in the Streamlit sidebar and select
-**Show indexed chunks**. The API also exposes
-`GET /documents/{document_name}/chunks?offset=0&limit=20`.
+### 3. Start the API and client
 
-## 4. Start the API and chat UI
-
-Keep the virtual environment active. In the first PowerShell terminal, from the
-project root:
+In the first PowerShell terminal, from the project root:
 
 ```powershell
+.\.venv\Scripts\Activate.ps1
 $env:PYTHONPATH = "server"
 python -m uvicorn api.main:app --reload
 ```
@@ -127,62 +206,91 @@ $env:POLICY_API_URL = "http://localhost:8000"
 python -m streamlit run client\streamlit_app.py
 ```
 
-Open `http://localhost:8501` and ask a merchant policy question. The server API
-is at `http://localhost:8000`; interactive API docs are at `/docs`.
+Open `http://localhost:8501` to use the chatbot. The API is available at
+`http://localhost:8000`, and interactive API documentation is at
+`http://localhost:8000/docs`.
 
-## Data and configuration
+## Configuration
 
 | Setting | Purpose | Default |
 |---|---|---|
 | `GROQ_API_KEY` | Groq chat API key | Required |
 | `GROQ_MODEL` | Groq chat model | `openai/gpt-oss-120b` |
-| `PROMPT_VERSION` | Versioned prompt set | `v1` |
-| `EMBEDDING_MODEL` | Local Hugging Face sentence-transformer model | `sentence-transformers/all-MiniLM-L6-v2` |
-| `DOCUMENT_DIRECTORY` | Original PDFs, DOCX, and HTML files | `<project>/server/data/documents` |
+| `PROMPT_VERSION` | Prompt set directory version | `v1` |
+| `EMBEDDING_MODEL` | Local sentence-transformer model | `sentence-transformers/all-MiniLM-L6-v2` |
+| `DOCUMENT_DIRECTORY` | Original policy documents | `<project>/server/data/documents` |
 | `CHROMA_PERSIST_DIRECTORY` | Persistent vector database | `<project>/server/data/chroma` |
-| `MEMORY_DATABASE_PATH` | Persistent SQLite conversation memory | `<project>/server/data/memory.sqlite3` |
-| `CHUNK_SIZE` / `CHUNK_OVERLAP` | Text chunking settings | `900` / `150` |
-| `RETRIEVAL_K` | Number of similar chunks to retrieve | `8` |
-| `RELEVANCE_THRESHOLD` | Minimum cosine-similarity score to answer | `0.35` |
+| `MEMORY_DATABASE_PATH` | SQLite conversation memory | `<project>/server/data/memory.sqlite3` |
+| `CHUNK_SIZE` / `CHUNK_OVERLAP` | Chunking settings in characters | `900` / `150` |
+| `RETRIEVAL_K` | Chunks requested per vector search | `8` |
+| `RELEVANCE_THRESHOLD` | Minimum similarity for evidence use | `0.35` |
+| `CORS_ORIGINS` | Allowed browser origins | `http://localhost:8501` |
+| `POLICY_API_URL` | API URL used by the Streamlit client | `http://localhost:8000` |
 
-The source files are the durable originals; Chroma stores the indexed chunks and
-embeddings. Back up both folders. If you restore the documents but lose the
-Chroma data, rerun `python -m ingestion.index_documents`.
+Settings can be provided through environment variables. In development, the
+server loads the project-root `.env` file and also supports `server/.env`.
+Deployment environments should provide secrets through environment variables
+or a secret manager.
 
 ## API
 
-- `GET /health`
-- `GET /documents`
-- `GET /conversations/{conversation_id}`
-- `DELETE /conversations/{conversation_id}`
-- `POST /chat` with `{"question":"What is the settlement schedule?"}`
+| Method and path | Description |
+|---|---|
+| `GET /health` | Check API health. |
+| `POST /chat` | Submit a policy question and optional conversation ID. |
+| `GET /conversations/{conversation_id}` | Get retained messages for a conversation. |
+| `DELETE /conversations/{conversation_id}` | Delete retained conversation history. |
+| `GET /documents` | List indexed documents and chunk counts. |
+| `GET /documents/{document_name}/chunks?offset=0&limit=20` | Inspect indexed chunks for a document. |
 
-Chat responses include `answer`, `confidence`, `sources`, and
-`conversation_id`. If evidence is missing, insufficient, or fails grounding
-verification, the API returns the configured no-answer message instead of
-generating an unsupported answer. The retrieval refinement is bounded to one
-extra pass with at most two additional search queries.
+Example chat request:
+
+```json
+{
+  "question": "What is the settlement schedule?",
+  "conversation_id": "optional-existing-conversation-id"
+}
+```
+
+The response contains `answer`, `confidence`, `sources`, and
+`conversation_id`. If no conversation ID is supplied, the API creates one.
 
 ## Docker
 
-Configure `.env`, place documents under `server/data/documents/`, then start:
+Configure `.env`, place policy files in `server/data/documents/`, then index
+and start the services from the project root:
 
 ```powershell
 docker compose run --build --rm server python -m ingestion.index_documents
 docker compose up --build -d
 ```
 
-Docker uses a persistent named volume for Chroma and the local documents folder
-as a read-only bind mount. Run the indexing command before starting the API, and
-repeat it after policy source files change. Stop the running server before
-reindexing so the Chroma database is not open in two processes. The first
-indexing run also downloads the local embedding model.
+Docker Compose uses persistent volumes for Chroma and conversation memory and
+mounts source documents read-only. Reindex after policy files change; stop the
+running server before reindexing. The initial indexing run downloads the local
+embedding model.
 
 ## Tests
 
-From the project root:
+From the project root with the virtual environment active:
 
 ```powershell
 $env:PYTHONPATH = "server"
 python -m pytest tests
 ```
+
+## Current boundaries
+
+- Retrieval uses vector similarity search; BM25, reciprocal-rank fusion, and
+  graph retrieval are not implemented.
+- Policy files are indexed from the configured local directory. There is no
+  document-upload UI or ingestion API.
+- Scanned image-only PDF pages are not OCR-processed.
+- Conversation recall uses bounded SQLite history and term overlap. It is
+  conversation context, not a separate vector memory or a source of policy
+  facts.
+- Confidence is based on retrieved-chunk similarity and should not be read as a
+  calibrated probability.
+
+For detailed internals, see [BACKEND_ARCHITECTURE.md](./BACKEND_ARCHITECTURE.md)
+and [PROJECT_STRUCTURE.md](./PROJECT_STRUCTURE.md).
