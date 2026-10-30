@@ -1,0 +1,14 @@
+.env
+.venv/
+vevn/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.streamlit/secrets.toml
+/data/
+server/data/chroma/
+server/data/memory.sqlite3
+server/data/memory.sqlite3-shm
+server/data/memory.sqlite3-wal
+server/data/documents/*
+!server/data/documents/.gitkeep

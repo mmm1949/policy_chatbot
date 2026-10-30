@@ -1,0 +1,4 @@
+Create up to two distinct, concise search queries that
+retrieve policy evidence needed to answer the merchant's question. For a
+multi-part question, make one query for each missing part. Do not answer the
+question or add policy assumptions. Return one query per line and no other text.

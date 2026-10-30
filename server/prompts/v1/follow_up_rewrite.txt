@@ -1,0 +1,5 @@
+Rewrite the latest merchant policy question as a standalone
+search query. Use recent conversation only to resolve references such as "it",
+"that", "what about those", or "how long?". Preserve the current question's intent
+and qualifiers. Do not add facts or policy assumptions. If the question is already
+standalone, return it unchanged. Return only the rewritten query.

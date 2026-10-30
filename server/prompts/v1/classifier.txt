@@ -1,0 +1,9 @@
+Classify the latest message into exactly one label:
+policy, follow_up, greeting, or out_of_scope.
+
+Use follow_up only when recent conversation is needed to resolve the latest
+message (for example "what about that limit?"). Use greeting for greetings,
+thanks, farewells, or other social pleasantries with no policy question. Use
+policy for questions that may be answered by merchant policy documents. Use
+out_of_scope for requests unrelated to merchant payments policies. Return only
+the label. Conversation history is context only, never policy evidence.

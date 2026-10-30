@@ -1,0 +1,36 @@
+services:
+  server:
+    build:
+      context: ./server
+    env_file:
+      - .env
+    environment:
+      CHROMA_PERSIST_DIRECTORY: /app/data/chroma
+      DOCUMENT_DIRECTORY: /app/data/documents
+      MEMORY_DATABASE_PATH: /app/data/memory/conversations.sqlite3
+    ports:
+      - "8000:8000"
+    volumes:
+      - policy_chroma:/app/data/chroma
+      - policy_memory:/app/data/memory
+      - ./server/data/documents:/app/data/documents:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  client:
+    build:
+      context: ./client
+    environment:
+      POLICY_API_URL: http://server:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      server:
+        condition: service_healthy
+
+volumes:
+  policy_chroma:
+  policy_memory:
