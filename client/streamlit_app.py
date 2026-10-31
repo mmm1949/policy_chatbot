@@ -1,3 +1,4 @@
+import html
 import os
 import uuid
 
@@ -7,6 +8,13 @@ import streamlit as st
 
 API_URL = os.getenv("POLICY_API_URL", "http://localhost:8000").rstrip("/")
 st.set_page_config(page_title="Toucan Merchant Assistant", layout="wide")
+
+SAMPLE_QUESTIONS = [
+    ("Refunds", "What is the refund policy for merchants?"),
+    ("Settlements", "How long do settlements take to reach my account?"),
+    ("Chargebacks", "What are the timelines for disputing a chargeback?"),
+    ("Restrictions", "Which business types are prohibited or restricted?"),
+]
 
 st.markdown(
     """
@@ -28,33 +36,45 @@ st.markdown(
             var(--toucan-canvas);
     }
 
+    /* Streamlit's own header is replaced by our fixed navbar */
     [data-testid="stHeader"] {
-        background: transparent;
+        display: none;
     }
 
     [data-testid="stMainBlockContainer"],
     [data-testid="stBottomBlockContainer"] {
-        max-width: 1000px;
+        max-width: 820px;
         width: calc(100% - 2.5rem);
         margin-left: auto;
         margin-right: auto;
     }
 
+    [data-testid="stMainBlockContainer"] {
+        padding-top: 5.5rem;
+        padding-bottom: 7rem;
+    }
+
+    /* ---------- Fixed navbar ---------- */
     .toucan-navbar {
-        position: sticky;
+        position: fixed;
         top: 0;
-        z-index: 1000;
+        left: 0;
+        right: 0;
+        z-index: 999999;
+        background: rgba(6, 29, 61, 0.94);
+        backdrop-filter: blur(10px);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.10);
+        box-shadow: 0 8px 28px rgba(6, 29, 61, 0.18);
+    }
+
+    .toucan-navbar-inner {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 0.85rem 1.25rem;
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 1.5rem;
-        margin: -0.2rem 0 2rem;
-        padding: 0.95rem 1.25rem;
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        border-radius: 18px;
-        background: rgba(6, 29, 61, 0.88);
-        backdrop-filter: blur(10px);
-        box-shadow: 0 14px 35px rgba(6, 29, 61, 0.16);
     }
 
     .toucan-brand {
@@ -70,8 +90,17 @@ st.markdown(
         color: var(--toucan-orange);
     }
 
+    .toucan-nav-tag {
+        color: #79e0d0;
+        font-size: 0.72rem;
+        font-weight: 800;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+    }
+
+    /* ---------- Hero ---------- */
     .toucan-hero {
-        margin: 0 auto 2rem;
+        margin: 0.5rem auto 1.4rem;
         padding: 1.9rem 2rem;
         border-radius: 22px;
         background: linear-gradient(122deg, #092c5c 0%, #1555a5 72%, #1769bb 100%);
@@ -104,6 +133,56 @@ st.markdown(
         line-height: 1.55;
     }
 
+    .toucan-suggest-label {
+        margin: 0.4rem 0 0.6rem;
+        color: var(--toucan-muted);
+        font-size: 0.78rem;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+    }
+
+    /* ---------- Sample question cards ---------- */
+    [class*="st-key-suggest-"] button {
+        width: 100%;
+        min-height: 72px;
+        padding: 0.9rem 1.1rem;
+        justify-content: flex-start;
+        text-align: left;
+        border: 1px solid #dce7f5;
+        border-radius: 16px;
+        background: #ffffff;
+        color: var(--toucan-ink);
+        box-shadow: 0 4px 14px rgba(6, 29, 61, 0.05);
+        transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+    }
+
+    [class*="st-key-suggest-"] button > div {
+        justify-content: flex-start;
+        width: 100%;
+    }
+
+    [class*="st-key-suggest-"] button p {
+        text-align: left;
+        font-size: 0.95rem;
+        font-weight: 500;
+        line-height: 1.4;
+        color: var(--toucan-ink);
+    }
+
+    [class*="st-key-suggest-"] button:hover {
+        border-color: var(--toucan-teal);
+        background: #ffffff;
+        box-shadow: 0 8px 22px rgba(18, 184, 159, 0.16);
+        transform: translateY(-1px);
+    }
+
+    [class*="st-key-suggest-"] button:focus:not(:active) {
+        border-color: var(--toucan-teal);
+        color: var(--toucan-ink);
+    }
+
+    /* ---------- Chat messages ---------- */
     [class*="st-key-chat-user-"],
     [class*="st-key-chat-assistant-"] {
         display: flex !important;
@@ -111,7 +190,6 @@ st.markdown(
         width: 100%;
     }
 
-    /* column layout: align-items controls left/right placement */
     [class*="st-key-chat-user-"] {
         align-items: flex-end !important;
     }
@@ -120,45 +198,21 @@ st.markdown(
         align-items: flex-start !important;
     }
 
-    [class*="st-key-chat-user-"] [data-testid="stChatMessage"],
-    [class*="st-key-chat-assistant-"] [data-testid="stChatMessage"] {
-        width: 100%;
-        max-width: 100%;
-        padding: 0.85rem 1.05rem;
-        border: 1px solid transparent;
-        border-radius: 18px;
-        box-shadow: 0 5px 18px rgba(6, 29, 61, 0.08);
-    }
-
-    [class*="st-key-chat-user-"] [data-testid="stChatMessage"] {
-        border-color: #dce7f5;
-        background: #eaf1fb;
-        color: var(--toucan-ink);
-    }
-
-    [class*="st-key-chat-assistant-"] [data-testid="stChatMessage"] {
-        border-color: #173966;
-        background: var(--toucan-navy);
-        color: #f4f8ff;
-    }
-
-    [class*="st-key-chat-user-"] [data-testid^="stChatMessageAvatar"],
-    [class*="st-key-chat-assistant-"] [data-testid^="stChatMessageAvatar"] {
+    [data-testid^="stChatMessageAvatar"] {
         display: none !important;
     }
 
-    [class*="st-key-chat-user-"] [data-testid="stChatMessage"] p,
-    [class*="st-key-chat-user-"] [data-testid="stChatMessage"] li,
-    [class*="st-key-chat-user-"] [data-testid="stChatMessage"] strong,
-    [class*="st-key-chat-user-"] [data-testid="stChatMessage"] em,
-    [class*="st-key-chat-assistant-"] [data-testid="stChatMessage"] p,
-    [class*="st-key-chat-assistant-"] [data-testid="stChatMessage"] li,
-    [class*="st-key-chat-assistant-"] [data-testid="stChatMessage"] strong,
-    [class*="st-key-chat-assistant-"] [data-testid="stChatMessage"] em {
-        color: inherit;
+    /* User: compact rounded bubble on the right */
+    [class*="st-key-chat-user-"] [data-testid="stChatMessage"] {
+        width: fit-content;
+        max-width: 80%;
+        padding: 0.7rem 1.1rem;
+        border: 1px solid #dce7f5;
+        border-radius: 20px 20px 6px 20px;
+        background: #eaf1fb;
+        box-shadow: 0 3px 12px rgba(6, 29, 61, 0.05);
     }
 
-    /* user message: dark text, right-aligned */
     [class*="st-key-chat-user-"] [data-testid="stChatMessage"],
     [class*="st-key-chat-user-"] [data-testid="stChatMessage"] * {
         color: #0b1a2e !important;
@@ -172,22 +226,104 @@ st.markdown(
         color: #0b1a2e !important;
     }
 
-    [class*="st-key-chat-user-"] [data-testid="stChatMessage"] a {
-        color: #1555a5;
+    /* Assistant: no bubble, plain readable text like Claude */
+    [class*="st-key-chat-assistant-"] [data-testid="stChatMessage"] {
+        width: 100%;
+        max-width: 100%;
+        padding: 0.2rem 0 0.4rem;
+        border: none;
+        background: transparent;
+        box-shadow: none;
+        color: var(--toucan-ink);
+    }
+
+    [class*="st-key-chat-assistant-"] [data-testid="stChatMessage"] p,
+    [class*="st-key-chat-assistant-"] [data-testid="stChatMessage"] li {
+        color: var(--toucan-ink);
+        font-size: 1rem;
+        line-height: 1.7;
+    }
+
+    [class*="st-key-chat-assistant-"] [data-testid="stChatMessage"] strong {
+        color: var(--toucan-navy);
     }
 
     [class*="st-key-chat-assistant-"] [data-testid="stChatMessage"] a {
-        color: #8adfd2;
+        color: var(--toucan-blue);
     }
 
-    [class*="st-key-chat-user-"] [data-testid="stChatMessage"] [data-testid="stCaptionContainer"] {
+    .assistant-head {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        margin-bottom: 0.45rem;
+    }
+
+    .assistant-avatar {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 30px;
+        height: 30px;
+        border-radius: 50%;
+        background: var(--toucan-navy);
+        color: var(--toucan-orange);
+        font-size: 0.85rem;
+        font-weight: 800;
+        box-shadow: 0 4px 12px rgba(6, 29, 61, 0.22);
+    }
+
+    .assistant-name {
+        color: var(--toucan-navy);
+        font-size: 0.86rem;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+    }
+
+    /* Sources and confidence chips */
+    .meta-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.45rem;
+        margin-top: 0.7rem;
+        padding-top: 0.7rem;
+        border-top: 1px solid #dce7f5;
+    }
+
+    .meta-label {
         color: var(--toucan-muted);
+        font-size: 0.72rem;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
     }
 
-    [class*="st-key-chat-assistant-"] [data-testid="stChatMessage"] [data-testid="stCaptionContainer"] {
-        color: #91a8c7;
+    .src-chip {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.28rem 0.7rem;
+        border: 1px solid #cfe0f5;
+        border-radius: 999px;
+        background: #ffffff;
+        color: var(--toucan-blue);
+        font-size: 0.78rem;
+        font-weight: 600;
     }
 
+    .conf-chip {
+        display: inline-flex;
+        align-items: center;
+        margin-left: auto;
+        padding: 0.28rem 0.7rem;
+        border-radius: 999px;
+        background: rgba(18, 184, 159, 0.12);
+        color: #0b7f6d;
+        font-size: 0.78rem;
+        font-weight: 700;
+    }
+
+    /* ---------- Input ---------- */
     [data-testid="stBottomBlockContainer"] {
         padding-top: 0.6rem;
         padding-bottom: 0.8rem;
@@ -206,7 +342,7 @@ st.markdown(
         width: 100%;
         max-width: 100%;
         border: 1px solid #244d7d;
-        border-radius: 18px;
+        border-radius: 22px;
         background: var(--toucan-navy);
         box-shadow: 0 10px 30px rgba(6, 29, 61, 0.2);
     }
@@ -226,60 +362,65 @@ st.markdown(
     [data-testid="stChatInput"] button {
         color: #fff;
         background: var(--toucan-blue);
-        border-radius: 12px;
+        border-radius: 14px;
     }
 
     [data-testid="stChatInput"] button:hover {
         background: var(--toucan-bright-blue);
-    } 
+    }
 
+    /* ---------- Thinking indicator ---------- */
     [data-testid="stSpinner"] {
-    background: var(--toucan-navy);
-    border: 1px solid #244d7d;
-    border-radius: 12px;
-    padding: 0.75rem 1rem;
-    box-shadow: 0 8px 24px rgba(6, 29, 61, 0.15);
+        padding: 0.4rem 0;
     }
 
     [data-testid="stSpinner"] p {
-        color: #f4f8ff !important;
+        color: var(--toucan-muted) !important;
         font-weight: 500;
+        font-style: italic;
     }
-    
-    /* Style the loading spinner animation circle/element if needed */
-    [data-testid="stSpinner"] svg {
+
+    [data-testid="stSpinner"] svg,
+    [data-testid="stSpinner"] i {
         color: var(--toucan-teal) !important;
+        border-top-color: var(--toucan-teal) !important;
     }
 
     @media (max-width: 640px) {
         [data-testid="stMainBlockContainer"] {
-            padding: 0.8rem 0.8rem 6rem;
+            padding: 5rem 0.8rem 6rem;
         }
 
-        .toucan-navbar {
-            align-items: flex-start;
-            flex-direction: column;
-            gap: 0.8rem;
+        .toucan-navbar-inner {
+            padding: 0.75rem 1rem;
+        }
+
+        .toucan-nav-tag {
+            display: none;
         }
 
         .toucan-hero {
             padding: 1.4rem;
         }
 
+        [class*="st-key-chat-user-"] [data-testid="stChatMessage"] {
+            max-width: 92%;
+        }
+
+        .conf-chip {
+            margin-left: 0;
+        }
     }
     </style>
 
     <nav class="toucan-navbar" aria-label="Toucan">
-        <a class="toucan-brand" href="https://toucanus.com/" target="_blank" rel="noreferrer">
-            TOUCAN
-        </a>
+        <div class="toucan-navbar-inner">
+            <a class="toucan-brand" href="https://toucanus.com/" target="_blank" rel="noreferrer">
+                TOUCAN
+            </a>
+            <span class="toucan-nav-tag">Merchant support</span>
+        </div>
     </nav>
-
-    <section class="toucan-hero">
-        <div class="toucan-eyebrow">Toucan · Merchant support</div>
-        <h1>Policy answers, made clear.</h1>
-        <p>Ask a question about your merchant policies. Answers are grounded in the available policy documents and include their sources.</p>
-    </section>
     """,
     unsafe_allow_html=True,
 )
@@ -296,29 +437,49 @@ def _request_error(exc: requests.RequestException) -> str:
     return str(exc)
 
 
+def _meta_html(message: dict) -> str:
+    chips = []
+    sources = message.get("sources") or []
+    if sources:
+        chips.append('<span class="meta-label">Sources</span>')
+        for source in sources:
+            label = source["document"] + (
+                f", page {source['page']}" if source.get("page") else ""
+            )
+            chips.append(f'<span class="src-chip">{html.escape(label)}</span>')
+    confidence = message.get("confidence")
+    if confidence is not None:
+        chips.append(
+            f'<span class="conf-chip">Confidence {float(confidence):.0%}</span>'
+        )
+    if not chips:
+        return ""
+    return f'<div class="meta-row">{"".join(chips)}</div>'
+
+
 def _render_message(message: dict, message_index: int) -> None:
     role = "user" if message["role"] == "user" else "assistant"
     with st.container(key=f"chat-{role}-{message_index}"):
         with st.chat_message(role, width="stretch"):
             if role == "assistant":
+                st.markdown(
+                    '<div class="assistant-head">'
+                    '<span class="assistant-avatar">T</span>'
+                    '<span class="assistant-name">Toucan Assistant</span>'
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
                 st.markdown(message["content"])
             else:
                 st.text(message["content"])
 
-            details = []
-            sources = message.get("sources") or []
-            if sources:
-                citations = "; ".join(
-                    source["document"]
-                    + (f", page {source['page']}" if source.get("page") else "")
-                    for source in sources
-                )
-                details.append(f"Sources: {citations}")
-            confidence = message.get("confidence")
-            if confidence is not None:
-                details.append(f"Confidence: {float(confidence):.0%}")
-            if details:
-                st.caption(" · ".join(details))
+            meta = _meta_html(message)
+            if meta:
+                st.markdown(meta, unsafe_allow_html=True)
+
+
+def _queue_question(text: str) -> None:
+    st.session_state.pending_question = text
 
 
 if "messages" not in st.session_state:
@@ -344,17 +505,44 @@ if not st.session_state.history_loaded:
     finally:
         st.session_state.history_loaded = True
 
+# A clicked sample question is handled exactly like a typed one.
+clicked_question = st.session_state.pop("pending_question", None)
+
+# Welcome screen (hero + sample questions) only before the conversation starts.
+if not st.session_state.messages and not clicked_question:
+    st.markdown(
+        """
+        <section class="toucan-hero">
+            <div class="toucan-eyebrow">Toucan · Merchant support</div>
+            <h1>Policy answers, made clear.</h1>
+            <p>Ask a question about your merchant policies. Answers are grounded in the available policy documents and include their sources.</p>
+        </section>
+        <div class="toucan-suggest-label">Try asking</div>
+        """,
+        unsafe_allow_html=True,
+    )
+    columns = st.columns(2)
+    for index, (title, text) in enumerate(SAMPLE_QUESTIONS):
+        with columns[index % 2]:
+            st.button(
+                text,
+                key=f"suggest-{index}",
+                on_click=_queue_question,
+                args=(text,),
+                use_container_width=True,
+            )
+
 for message_index, chat_message in enumerate(st.session_state.messages):
     _render_message(chat_message, message_index)
 
-question = st.chat_input("Write a message...")
+question = st.chat_input("Write a message...") or clicked_question
 if question:
     user_message = {"role": "user", "content": question}
     st.session_state.messages.append(user_message)
     _render_message(user_message, len(st.session_state.messages) - 1)
 
     try:
-        with st.spinner("Searching policy documents..."):
+        with st.spinner("Processing your message..."):
             response = requests.post(
                 f"{API_URL}/chat",
                 json={

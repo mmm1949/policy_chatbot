@@ -31,12 +31,16 @@ class FakeModel:
             return AIMessage(content="What is the payout limit?")
         if "Create up to two distinct" in system_prompt:
             return AIMessage(content="account limit details\npayout limit details")
-        if "Decide whether the supplied policy excerpts" in system_prompt:
-            if "Payout limit policy" in human_prompt:
-                return AIMessage(content="SUFFICIENT")
-            return AIMessage(content="INSUFFICIENT")
         if "Check whether every factual claim" in system_prompt:
-            return AIMessage(content="GROUNDED" if self.grounded else "UNSUPPORTED")
+            has_complete_evidence = (
+                "Payout limit policy" in human_prompt
+                or "Account limit policy" not in human_prompt
+            )
+            return AIMessage(
+                content="GROUNDED"
+                if self.grounded and has_complete_evidence
+                else "UNSUPPORTED"
+            )
         if "Answer the current question" in system_prompt:
             return AIMessage(content=self.answer)
         return AIMessage(content="Hello! Ask me about merchant policies.")
@@ -47,7 +51,9 @@ class FakeRetriever:
         self.mode = mode
         self.queries: list[str] = []
 
-    def search(self, query: str) -> list[tuple[Document, float]]:
+    def search(
+        self, query: str, _filters: dict[str, str] | None = None
+    ) -> list[tuple[Document, float]]:
         self.queries.append(query)
         if self.mode == "multi_hop" and query == "What is the account limit and payout limit?":
             return [(self._document("Account limit policy"), 0.82)]
@@ -105,13 +111,14 @@ def test_graph_refines_once_and_keeps_evidence_from_both_search_passes() -> None
         "account limit details",
         "payout limit details",
     ]
-    relevance_calls = [
+    grounding_calls = [
         human for system, human in service.model.calls
-        if "Decide whether the supplied policy excerpts" in system
+        if "Check whether every factual claim" in system
     ]
-    assert len(relevance_calls) == 2
-    assert "Account limit policy" in relevance_calls[1]
-    assert "Payout limit policy" in relevance_calls[1]
+    assert len(grounding_calls) == 2
+    assert "Account limit policy" in grounding_calls[0]
+    assert "Account limit policy" in grounding_calls[1]
+    assert "Payout limit policy" in grounding_calls[1]
 
 
 def test_unsupported_answer_is_replaced_with_fixed_no_answer() -> None:
@@ -200,3 +207,80 @@ def test_greeting_path_does_not_search_policy_documents() -> None:
         "sources": [],
     }
     assert retriever.queries == []
+
+
+def test_standalone_greeting_variants_skip_classifier_and_retrieval() -> None:
+    retriever = FakeRetriever()
+    service = make_service(retriever)
+
+    for index, greeting in enumerate(("Hi there!", "How are you?", "Thanks so much.")):
+        result = asyncio.run(service.answer(greeting, f"greeting-{index}"))
+        assert result["confidence"] == 0.0
+        assert result["sources"] == []
+
+    assert retriever.queries == []
+    assert service.model.calls == []
+
+
+def test_direct_policy_question_is_not_reclassified_as_follow_up() -> None:
+    service = make_service(FakeRetriever())
+    state = {
+        "question": "A card was declined with code 59. Is that serious?",
+        "history": [
+            {"role": "user", "content": "A card was declined with code 59. Is that serious?"},
+            {"role": "assistant", "content": NO_ANSWER},
+        ],
+        "memories": [],
+    }
+
+    result = asyncio.run(service._classify(state))
+
+    assert result == {"category": "policy"}
+    assert service.model.calls == []
+
+
+def test_repeated_policy_question_does_not_prompt_with_previous_no_answer() -> None:
+    service = make_service(FakeRetriever())
+
+    asyncio.run(
+        service.answer(
+            "A card was declined with code 59. Is that serious?",
+            "repeat-policy",
+        )
+    )
+
+    answer_prompts = [
+        human for system, human in service.model.calls
+        if "Answer the current question" in system
+    ]
+    assert answer_prompts
+    assert NO_ANSWER not in answer_prompts[0]
+    assert "No earlier messages." in answer_prompts[0]
+
+
+def test_contextual_follow_up_still_uses_conversation_history() -> None:
+    service = make_service(FakeRetriever())
+    state = {
+        "question": "What about that?",
+        "history": [
+            {"role": "user", "content": "What is the payout limit?"},
+            {"role": "assistant", "content": "$500"},
+        ],
+        "memories": [],
+    }
+
+    result = asyncio.run(service._classify(state))
+
+    assert result == {"category": "follow_up"}
+    assert service.model.calls == []
+
+
+def test_greeting_with_policy_question_is_still_retrieved() -> None:
+    retriever = FakeRetriever()
+    service = make_service(retriever)
+
+    asyncio.run(
+        service.answer("Hi, what is the payout limit?", "greeting-policy")
+    )
+
+    assert retriever.queries[0] == "Hi, what is the payout limit?"

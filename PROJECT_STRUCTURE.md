@@ -25,6 +25,7 @@ policy_chatbot/
 │   ├── models/
 │   │   └── schemas.py
 │   ├── retrieval/
+│   │   ├── parent_store.py
 │   │   └── vector.py
 │   ├── services/
 │   │   ├── knowledge_base.py
@@ -35,7 +36,6 @@ policy_chatbot/
 │   │   └── v1/
 │   │       ├── answer.txt
 │   │       ├── classifier.txt
-│   │       ├── evidence_relevance.txt
 │   │       ├── follow_up_rewrite.txt
 │   │       ├── grounding.txt
 │   │       ├── query_refinement.txt
@@ -74,8 +74,9 @@ flowchart LR
     API --> SCHEMA[server/models/schemas.py]
     API --> GRAPH[server/services/rag.py]
     GRAPH --> MEMORY[server/services/memory.py]
-    GRAPH --> RETRIEVER[server/retrieval/vector.py]
-    RETRIEVER --> DB[(server/data/chroma)]
+    GRAPH --> RETRIEVER[Hybrid retriever]
+    RETRIEVER --> DB[(Chroma + BM25)]
+    RETRIEVER --> PARENTS[(Parent sections SQLite)]
     GRAPH --> GROQ[Groq model]
     API --> KB[server/services/knowledge_base.py]
     KB --> DB
@@ -87,8 +88,8 @@ flowchart LR
 3. FastAPI validates the request and calls `RAGService.answer()`.
 4. The LangGraph workflow recalls recent and relevant older messages from
    SQLite, then classifies the message. A follow-up is rewritten using that
-   conversation context. A policy question is sent through Chroma retrieval and
-   relevance checks.
+   conversation context. A policy question gets metadata-filtered BM25 and
+   Chroma retrieval, RRF fusion, and cross-encoder reranking.
 5. If the first search is insufficient, the graph can run one refinement pass
    with up to two additional queries. A direct evidence check and grounding
    check gate policy answers.
@@ -201,7 +202,7 @@ responses; they do not perform retrieval or generate answers.
 The main RAG orchestration service. It constructs a LangGraph `StateGraph`,
 invokes its nodes for each question, formats retrieved evidence, and updates
 conversation memory. Versioned prompts in `server/prompts/v1/` instruct Groq how
-to classify, rewrite, refine, assess relevance, answer, and verify grounding.
+to classify, rewrite, refine, answer, and verify grounding.
 
 Types:
 
@@ -212,42 +213,40 @@ Types:
 
 `RAGService` methods:
 
-- `__init__(settings, retriever)` — Validates the Groq key, configures the model
-  and retrieval threshold, creates persistent conversation memory and the
+- `__init__(settings, retriever)` — Validates the Groq key, configures the model,
+  creates persistent conversation memory and the
   prompt manager, and compiles the graph.
 - `_build_graph()` — Registers graph nodes and edges, including conditional
-  routing for memory recall, message type, evidence sufficiency, and grounding.
+  routing for memory recall, message type, and grounding.
 - `answer(question, conversation_id)` — Initializes a clean per-turn state,
   invokes the asynchronous graph, and returns its public result.
 - `_recall_memory(state)` — Loads recent and query-relevant conversation
   exchanges for context resolution.
-- `_evaluate_and_generate(state)` — Runs evidence sufficiency and answer
-  drafting concurrently; only a sufficient, grounded answer can be returned.
-- `_classify(state)` — Handles common standalone pleasantries locally and
-  otherwise asks the model to classify the message as policy, follow-up,
-  greeting, or out-of-scope.
+- `_evaluate_and_generate(state)` — Drafts an answer from retrieved evidence;
+  only a cited and grounded answer can be returned.
+- `_classify(state)` — Handles common pleasantries and obvious policy questions
+  locally, recognizes explicit contextual follow-ups, and asks the model to
+  classify less clear messages.
 - `_route_classification(state)` — Sends the classified state to greeting,
   fallback, retrieval, or follow-up rewriting.
 - `_rewrite_query(state)` — Converts a contextual follow-up into a standalone
   retrieval query without treating history as policy evidence.
-- `_retrieve(state)` — Runs vector search for active queries, merges duplicate
-  document/page/text hits, and records the best score.
-- `_check_relevance(state)` — Requires above-threshold excerpts and asks the
-  model whether they directly support an answer.
-- `_route_relevance(state)` — Chooses answer generation, one retrieval
+- `_retrieve(state)` — Infers metadata filters, runs hybrid search for active
+  queries, merges duplicate parent sources, and records reranker scores.
+- `_route_generation(state)` — Chooses grounding verification, one retrieval
   refinement, or the no-answer path.
 - `_refine_queries(state)` — Creates up to two additional targeted queries for
-  missing evidence and increments the bounded retrieval-pass counter.
-- `_generate_answer(state)` — Drafts a response from relevant excerpts and
-  builds the distinct source/page list. The graph discards the draft if evidence
-  is insufficient.
+  empty retrieval or failed grounding and increments the bounded retrieval-pass
+  counter.
+- `_generate_answer(state)` — Drafts a response from retrieved excerpts and
+  builds the distinct source/page list.
 - `_verify_grounding(state)` — Rejects answers whose citations do not match
   retrieved sources, then asks the model to verify evidence support.
 - `_citations_match_sources(answer, sources)` — Normalizes common full-width
   citation brackets and whitespace, then checks each citation against the
   retrieved document/page list.
-- `_route_grounding(state)` — Sends grounded responses to memory; ungrounded
-  responses to the fixed fallback.
+- `_route_grounding(state)` — Sends grounded responses to memory; gives an
+  ungrounded first-pass answer one retrieval refinement before fallback.
 - `_set_no_answer(state)` — Sets the fixed safe no-answer message and clears
   confidence and citations.
 - `_social_response(state)` — Handles greetings without supplying policy
@@ -294,13 +293,13 @@ Also exposes inspection data used by the document API routes.
 
 - `KnowledgeBase.__init__(settings)` — Creates configured directories, loads
   the local Hugging Face embedding model, opens the Chroma collection, and
-  creates a `VectorRetriever`.
+  creates a hybrid `VectorRetriever` and SQLite parent store.
 - `chunk_count` — Property returning the indexed chunk count.
-- `index_if_empty()` — Indexes configured documents only when the collection has
-  no chunks.
-- `index_directory()` — Loads supported files recursively, chunks and
-  sanitizes them, calculates stable IDs, writes current chunks, and deletes
-  obsolete IDs.
+- `index_if_empty()` — Indexes configured documents when the collection is empty
+  or lacks current hybrid-search metadata.
+- `index_directory()` — Loads supported files recursively, creates parent
+  sections/tables and child chunks, sanitizes metadata, calculates stable IDs,
+  writes current chunks and parent records, and deletes obsolete IDs.
 - `document_list()` — Groups stored metadata into per-document counts and
   categories.
 - `document_chunks(name, offset, limit)` — Returns sorted stored chunks for one
@@ -330,9 +329,11 @@ and indexed by command or on empty-database startup.
 
 #### `server/ingestion/chunker.py`
 
+- `split_parent_documents(documents, parent_size)` — Creates parent sections
+  and preserves complete tables.
 - `split_documents(documents, chunk_size, chunk_overlap)` — Splits documents
-  into overlapping text chunks, preserves metadata, adds start indices, and
-  assigns chunk identifiers.
+  into overlapping child chunks, preserves parent IDs, adds start indices, and
+  assigns stable chunk identifiers.
 
 #### `server/ingestion/index_documents.py`
 
@@ -346,15 +347,20 @@ and indexed by command or on empty-database startup.
 
 #### `server/retrieval/vector.py`
 
-- `cosine_distance_to_similarity(distance)` — Converts Chroma cosine distance
-  to a clamped similarity score.
-- `VectorRetriever.__init__(vector_store, k)` — Stores the Chroma instance and
-  retrieval limit.
-- `VectorRetriever.search(query)` — Returns the top matching LangChain
-  documents and similarity scores, or an empty list for an empty collection.
+- `infer_metadata_filters(query)` — Detects supported region, policy type,
+  payment method, version, and effective-date filters from a query.
+- `VectorRetriever.search(query, filters)` — Retrieves metadata-filtered
+  candidates with BM25 and Chroma, fuses ranks with RRF, reranks candidates,
+  and returns matching parent documents.
+- `VectorRetriever._get_reranker()` — Lazily loads the configured local
+  Sentence Transformers cross-encoder.
 
-This is vector similarity retrieval; the current implementation does not have
-BM25, hybrid RRF, or graph retrieval.
+#### `server/retrieval/parent_store.py`
+
+- `ParentDocumentStore.replace(documents)` — Persists the current parent
+  sections and tables in SQLite.
+- `ParentDocumentStore.get_many(parent_ids)` — Loads parent content for ranked
+  child chunks.
 
 ### Other backend files
 
@@ -413,8 +419,8 @@ source and should not be edited as part of normal feature work.
 Uses fake model and retriever objects so workflow paths can be tested without
 Groq network calls or a live Chroma database.
 
-- `FakeModel` — Returns deterministic classifier, rewrite, evidence-check,
-  answer, and grounding responses based on the prompt.
+- `FakeModel` — Returns deterministic classifier, rewrite, answer, and
+  grounding responses based on the prompt.
 - `FakeModel.ainvoke(messages)` — Mimics the asynchronous chat model interface.
 - `FakeRetriever` — Records query strings and returns controlled documents and
   scores.

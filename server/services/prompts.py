@@ -23,7 +23,6 @@ class PromptManager:
             "classifier": "classifier.txt",
             "follow_up_rewrite": "follow_up_rewrite.txt",
             "query_refinement": "query_refinement.txt",
-            "evidence_relevance": "evidence_relevance.txt",
             "answer": "answer.txt",
             "grounding": "grounding.txt",
             "social_response": "social_response.txt",

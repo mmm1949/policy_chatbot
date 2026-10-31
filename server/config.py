@@ -31,8 +31,11 @@ class Settings(BaseSettings):
     memory_database_path: Path = PROJECT_ROOT / "server" / "data" / "memory.sqlite3"
     chunk_size: int = 900
     chunk_overlap: int = 150
-    retrieval_k: int = 8
-    relevance_threshold: float = 0.35
+    retrieval_k: int = 20
+    reranker_top_k: int = 5
+    rrf_constant: int = 60
+    reranker_model: str = "BAAI/bge-reranker-base"
+    reranker_device: str = "auto"
     cors_origins: str = "http://localhost:8501"
 
     @field_validator(

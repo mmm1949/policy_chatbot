@@ -2,8 +2,8 @@
 
 This document describes the current Merchant Policy RAG Chatbot backend. The
 backend is a FastAPI application with a LangGraph-orchestrated RAG workflow,
-Groq answer generation, local sentence-transformer embeddings, and a persistent
-Chroma vector store.
+Groq answer generation, local sentence-transformer embeddings and reranking,
+hybrid retrieval, and persistent Chroma and SQLite stores.
 
 ## 1. Architecture at a glance
 
@@ -14,9 +14,12 @@ flowchart LR
     GRAPH --> MEM[Persistent conversation memory]
     PROMPTS[Versioned prompt files] --> GRAPH
     GRAPH --> RET[VectorRetriever]
-    RET --> CHROMA[(Persistent Chroma)]
+    RET --> CHROMA[(Chroma vector index)]
+    RET --> BM25[BM25 keyword index]
+    RET --> RERANK[Local BGE cross-encoder]
     CHROMA --> EMB[Local sentence-transformer]
-    GRAPH -->|classification, rewrite, grading, answer| GROQ[Groq chat model]
+    RET --> PARENTS[(SQLite parent sections/tables)]
+    GRAPH -->|classification when needed, rewrite, answer, grounding| GROQ[Groq chat model]
     GRAPH --> API
     API --> UI
 
@@ -26,9 +29,9 @@ flowchart LR
     EMB --> CHROMA
 ```
 
-The retrieval implementation is vector similarity search. It does not currently
-use BM25, reciprocal-rank fusion, or graph retrieval. Groq is used for language
-tasks only; embeddings are generated locally.
+Retrieval combines BM25 keyword search and Chroma vector search using
+Reciprocal Rank Fusion, then reranks candidates with a local BGE cross-encoder.
+Groq is used for language tasks only; embeddings and reranking run locally.
 
 ## 2. Components
 
@@ -41,8 +44,9 @@ tasks only; embeddings are generated locally.
 | [`server/services/memory.py`](./server/services/memory.py) | SQLite-backed conversation history and retrieval of relevant earlier exchanges, keyed by conversation ID. |
 | [`server/services/prompts.py`](./server/services/prompts.py) | Loads and renders named LangChain prompt templates from a versioned prompt directory. |
 | [`server/prompts/v1/`](./server/prompts/v1/) | Versioned prompt templates for classification, retrieval, generation, and grounding. |
-| [`server/retrieval/vector.py`](./server/retrieval/vector.py) | Chroma similarity search and distance-to-similarity conversion. |
-| [`server/services/knowledge_base.py`](./server/services/knowledge_base.py) | Local embedding model, Chroma collection, indexing, and indexed-document inspection. |
+| [`server/retrieval/vector.py`](./server/retrieval/vector.py) | Metadata-filtered BM25 and Chroma search, RRF fusion, and local cross-encoder reranking. |
+| [`server/retrieval/parent_store.py`](./server/retrieval/parent_store.py) | SQLite storage and lookup for parent sections and complete tables. |
+| [`server/services/knowledge_base.py`](./server/services/knowledge_base.py) | Local embedding model, Chroma collection, parent storage, indexing, and indexed-document inspection. |
 | [`server/ingestion/loaders.py`](./server/ingestion/loaders.py) | PDF, DOCX, and HTML text/table extraction and metadata. |
 | [`server/ingestion/chunker.py`](./server/ingestion/chunker.py) | Splits extracted content into overlapping chunks. |
 | [`server/ingestion/index_documents.py`](./server/ingestion/index_documents.py) | Command-line entry point for indexing or refreshing the policy directory. |
@@ -68,33 +72,36 @@ facts are loaded from conversation history.
 1. **`recall_memory`** loads recent history and retrieves older exchanges with
    overlapping terms from the same conversation. Recalled messages are context
    only, never evidence for policy claims.
-2. **`classify`** answers common standalone pleasantries locally and otherwise
-   asks Groq to label the message as `policy`, `follow_up`, `greeting`, or
-   `out_of_scope`. An invalid label is logged and treated as a policy question,
-   so retrieval and evidence checks still gate the response. A follow-up label
+2. **`classify`** answers common standalone pleasantries locally, routes clear
+   policy questions without a model call, and recognizes explicit contextual
+   follow-ups when history exists. Other messages are sent to Groq for
+   classification as `policy`, `follow_up`, `greeting`, or `out_of_scope`. An
+   invalid label is logged and treated as a policy question. A follow-up label
    with no recent history is treated as a policy question.
 3. **`rewrite`** runs only for follow-ups. It converts the latest question into
    a standalone search query using recent messages to resolve references.
    Otherwise, the original question is searched.
-4. **`retrieve`** runs vector search for the active query set. For refinement
-   queries, it merges duplicates and keeps the highest similarity for each
-   source/page/text result.
-5. **`evaluate_and_generate`** checks that at least one chunk meets
-   `RELEVANCE_THRESHOLD`, then runs the model's evidence-sufficiency check and
-   answer draft concurrently. The draft is only considered if evidence is
-   sufficient; otherwise it is discarded before refinement or fallback.
-   Similarity by itself does not establish evidence sufficiency.
-6. **`refine_queries`** runs at most once when the evidence check fails. Groq
-   proposes up to two separate searches for missing parts of the question. The
-   graph retrieves those results and checks evidence sufficiency again.
-7. **`verify_grounding`** checks that factual claims are supported by excerpts
+4. **`retrieve`** infers supported metadata filters from the original question,
+   applies them to BM25 and vector search, fuses the two rankings with RRF, and
+   reranks the candidate pool. It returns matching parent sections or complete
+   tables. For refinement queries, it merges duplicate sources and keeps the
+   highest reranker score.
+5. **`evaluate_and_generate`** drafts an answer from the reranked excerpts.
+   Empty retrieval skips generation and proceeds to refinement or fallback.
+6. **`verify_grounding`** checks that factual claims are supported by excerpts
    and cited. Citation validation matches the document/page against retrieved
    sources and normalizes common Unicode citation brackets and whitespace. If
-   verification fails, the generated response is discarded.
+   verification fails on the first pass, the graph tries one query refinement;
+   a second failure uses the fixed fallback. This replaces the separate
+   LLM-based evidence-sufficiency gate, reducing one model call while retaining
+   citation and grounding safeguards.
+7. **`refine_queries`** runs at most once when retrieval is empty or grounding
+   fails. Groq proposes up to two targeted searches, then the graph retrieves
+   and verifies the revised evidence.
 8. **`social_response`** handles classified greetings without policy context.
    Its restricted prompt allows social pleasantries but forbids factual answers.
 9. **`no_answer`** returns the fixed no-answer message for out-of-scope requests,
-   insufficient retrieval, or failed grounding.
+   empty retrieval after refinement, or failed grounding after refinement.
 10. **`remember`** appends the current user message and final response to SQLite
     once at the end of every graph path.
 
@@ -107,28 +114,30 @@ flowchart TD
     classify -->|follow_up| rewrite
     rewrite --> retrieve
     retrieve --> evaluate_and_generate
-    evaluate_and_generate -->|sufficient| verify_grounding
-    evaluate_and_generate -->|insufficient and first pass| refine_queries
+    evaluate_and_generate -->|has evidence| verify_grounding
+    evaluate_and_generate -->|empty and first pass| refine_queries
     refine_queries --> retrieve
-    evaluate_and_generate -->|insufficient after refinement| no_answer
     verify_grounding -->|grounded| remember
-    verify_grounding -->|unsupported| no_answer
+    verify_grounding -->|ungrounded and first pass| refine_queries
+    verify_grounding -->|ungrounded after refinement| no_answer
     social_response --> remember
     no_answer --> remember
     remember --> END
 ```
 
-Common standalone pleasantries are answered locally without a provider call,
-avoiding classification and response-generation latency. The refinement bound
-is one extra pass with no more than two additional search
-queries. If the model returns no valid refinement query, retrieval yields no
-additional evidence and the workflow reaches the fixed fallback. Groq/provider
-errors propagate to the API error handler rather than being converted into a
-successful-looking answer.
+Common standalone pleasantries are answered locally without a provider call.
+Clear policy questions bypass the classifier. There is no separate LLM
+evidence-sufficiency gate; generated answers must still pass citation matching
+and the grounding check. A failed grounding check gets at most one refinement
+pass with no more than two additional search queries. If the model returns no
+valid refinement query, retrieval yields no additional evidence and the
+workflow reaches the fixed fallback. Groq/provider errors propagate to the API
+error handler rather than being converted into a successful-looking answer.
 
-The returned confidence is the highest similarity among retrieved chunks for a
-grounded answer. It is a retrieval score, not a calibrated probability. Greeting
-responses and fallback answers have confidence `0.0` and no citations.
+The returned confidence is the highest cross-encoder score among retrieved
+evidence for a grounded answer. It is a ranking score, not a calibrated
+probability. Greeting responses and fallback answers have confidence `0.0` and
+no citations.
 
 ## 4. Request lifecycle and API
 
@@ -140,9 +149,10 @@ python -m uvicorn api.main:app --reload
 ```
 
 At startup, the FastAPI lifespan handler creates the knowledge base, opens
-Chroma, and indexes local policy documents only if the collection is empty. It
-then constructs `RAGService` and its compiled graph. `GROQ_API_KEY` must be
-configured for chat generation. Embeddings run locally.
+Chroma, and indexes local policy documents if the collection is empty or lacks
+the current hybrid-search metadata. It then constructs `RAGService` and its
+compiled graph. `GROQ_API_KEY` must be configured for chat generation.
+Embeddings and reranking run locally.
 
 `POST /chat` validates the question, uses a supplied conversation ID or creates
 a UUID, invokes the graph, and returns `answer`, `confidence`, `sources`, and
@@ -197,13 +207,19 @@ Store original policy files in `server/data/documents/` by default. PDF, DOCX,
 HTML, and HTM are supported. PDFs are directly parsed for text and tables;
 OCR is not performed, so image-only PDF pages do not produce searchable text.
 Extracted metadata includes document/source information, page where available,
-section headings, content type, and inferred policy category.
+section headings, content type, policy type, region, version, effective date,
+and payment method. Region/version/date/payment tags are inferred conservatively
+from source text; missing or ambiguous values are marked `unspecified`.
 
-The indexer recursively loads supported files, splits content into overlapping
-chunks, removes null metadata, creates stable chunk IDs, embeds chunks locally,
-and writes them to the Chroma collection `merchant_policy_rag`. A successful
-reindex reconciles the collection with the current source directory. Run it
-after adding, changing, or removing policy sources:
+The indexer recursively loads supported files, creates parent sections and
+whole-table records, then splits them into smaller searchable chunks. Each
+chunk stores a parent ID, and complete parents are persisted in
+`server/data/chroma/parents.sqlite3`. Chunks are embedded locally and written to
+the Chroma collection `merchant_policy_rag`. At query time, BM25 and vector
+results are filtered by inferred metadata, fused with RRF, then reranked by a
+local BGE cross-encoder. A successful reindex reconciles the collection with
+the current source directory. Run it after adding, changing, or removing policy
+sources:
 
 ```powershell
 $env:PYTHONPATH = "server"
@@ -230,8 +246,11 @@ Streamlit client or commit it.
 | `DOCUMENT_DIRECTORY` | `<project>/server/data/documents` | Original policy documents. |
 | `MEMORY_DATABASE_PATH` | `<project>/server/data/memory.sqlite3` | Persistent conversation memory database. |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `900` / `150` | Chunk size and overlap in characters. |
-| `RETRIEVAL_K` | `8` | Chunks requested per vector search. |
-| `RELEVANCE_THRESHOLD` | `0.35` | Minimum similarity for evidence use. |
+| `RETRIEVAL_K` | `20` | Hybrid candidates passed to the reranker. |
+| `RERANKER_TOP_K` | `5` | Parent sections/tables returned after reranking. |
+| `RRF_CONSTANT` | `60` | Reciprocal Rank Fusion smoothing constant. |
+| `RERANKER_MODEL` | `BAAI/bge-reranker-base` | Local Sentence Transformers cross-encoder. |
+| `RERANKER_DEVICE` | `auto` | Reranker execution device: `auto`, `cpu`, or `cuda`. |
 | `CORS_ORIGINS` | `http://localhost:8501` | Comma-separated allowed origins. |
 | `POLICY_API_URL` | `http://localhost:8000` | Streamlit API base URL. |
 
@@ -266,7 +285,8 @@ python -m pytest tests
 ```
 
 The LangGraph tests cover grounded answers, bounded multi-query refinement,
-grounding rejection, follow-up rewriting, and conversation isolation. If the
-server returns an unexpected fallback, check source extraction and reindexing,
-the retrieval scores and threshold, and the evidence-check decisions in
-`server/services/rag.py`.
+grounding rejection, follow-up rewriting, and conversation isolation. Hybrid
+retrieval tests cover metadata inference, fusion/reranking, and parent records.
+If the server returns an unexpected fallback, check source extraction and
+reindexing, metadata filters, reranker output, and the evidence-check decisions
+in `server/services/rag.py`.

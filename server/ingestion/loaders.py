@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 import logging
 from pathlib import Path
+import re
 from typing import Iterable
 
 from bs4 import BeautifulSoup
@@ -96,7 +97,87 @@ def load_file(path: Path, document_name: str | None = None) -> list[Document]:
                 page_content=f"Extracted policy table:\n{table}",
                 metadata={**common, "content_type": "table", "table_index": table_index},
             ))
+    full_text = " ".join(
+        [path.name, *(document.page_content for document in result)]
+    )
+    metadata = {
+        "policy_type": _infer_policy_type(path.name, full_text),
+        "region": _infer_region(full_text),
+        "document_version": _infer_version(full_text),
+        "effective_date": _infer_effective_date(full_text),
+        "payment_method": _infer_payment_method(full_text),
+    }
+    for document in result:
+        document.metadata.update(metadata)
     return result
+
+
+def _infer_policy_type(name: str, text: str) -> str:
+    sample = f"{name} {text[:4000]}".casefold()
+    categories = (
+        ("prohibited_businesses", ("prohibited business", "restricted business", "prohibited industries")),
+        ("disputes", ("dispute", "chargeback")),
+        ("onboarding", ("onboard", "merchant terms")),
+        ("refunds", ("refund", "return policy")),
+        ("fees", ("fee schedule", "fees", "pricing")),
+        ("offboarding", ("offboard", "termination", "merchant exit")),
+    )
+    return next(
+        (
+            category
+            for category, terms in categories
+            if any(term in sample for term in terms)
+        ),
+        "general",
+    )
+
+
+def _infer_region(text: str) -> str:
+    regions = {
+        "India": r"\bIndia\b",
+        "United States": r"\b(?:United States|USA|U\.S\.)\b",
+        "United Kingdom": r"\b(?:United Kingdom|UK|U\.K\.)\b",
+        "European Union": r"\b(?:European Union|EU)\b",
+        "Canada": r"\bCanada\b",
+        "Australia": r"\bAustralia\b",
+    }
+    matches = [
+        region for region, pattern in regions.items()
+        if re.search(pattern, text, re.IGNORECASE)
+    ]
+    return matches[0] if len(matches) == 1 else "unspecified"
+
+
+def _infer_version(text: str) -> str:
+    match = re.search(
+        r"\bversion\s*[:#]?\s*([0-9]+(?:\.[0-9]+)*)\b",
+        text,
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else "unspecified"
+
+
+def _infer_effective_date(text: str) -> str:
+    match = re.search(
+        r"\beffective\s+(?:date|from|on|as of)\s*[:\-]?\s*"
+        r"(\d{4}-\d{2}-\d{2})\b",
+        text,
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else "unspecified"
+
+
+def _infer_payment_method(text: str) -> str:
+    methods = {
+        "card": r"\b(?:cards?|credit cards?|debit cards?)\b",
+        "UPI": r"\bUPI\b",
+        "bank_transfer": r"\b(?:bank transfers?|ACH|wire transfers?)\b",
+    }
+    matches = [
+        method for method, pattern in methods.items()
+        if re.search(pattern, text, re.IGNORECASE)
+    ]
+    return matches[0] if len(matches) == 1 else "unspecified"
 
 
 def _infer_category(name: str, text: str) -> str:

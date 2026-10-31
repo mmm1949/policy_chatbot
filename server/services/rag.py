@@ -10,6 +10,7 @@ from langgraph.graph import END, START, StateGraph
 
 from config import Settings
 from retrieval.vector import VectorRetriever
+from retrieval.vector import infer_metadata_filters
 from services.memory import ConversationMemory
 from services.prompts import PromptManager
 
@@ -37,7 +38,6 @@ class RAGState(TypedDict, total=False):
     retrieval_pass: int
     results: list[tuple[Document, float]]
     confidence: float
-    sufficient: bool
     grounded: bool
     answer: str
     sources: list[SourceReference]
@@ -54,7 +54,6 @@ class RAGService:
         if not settings.groq_api_key:
             raise ValueError("GROQ_API_KEY is not configured. Set it in the project-root .env file.")
         self.retriever = retriever
-        self.threshold = settings.relevance_threshold
         self.memory = ConversationMemory(settings.memory_database_path)
         self.prompts = PromptManager(settings.prompt_version)
         self.model = ChatGroq(
@@ -94,7 +93,7 @@ class RAGService:
         workflow.add_edge("retrieve", "evaluate_and_generate")
         workflow.add_conditional_edges(
             "evaluate_and_generate",
-            self._route_relevance,
+            self._route_generation,
             {
                 "verify": "verify_grounding",
                 "refine": "refine_queries",
@@ -105,7 +104,11 @@ class RAGService:
         workflow.add_conditional_edges(
             "verify_grounding",
             self._route_grounding,
-            {"remember": "remember", "no_answer": "no_answer"},
+            {
+                "remember": "remember",
+                "refine": "refine_queries",
+                "no_answer": "no_answer",
+            },
         )
         workflow.add_edge("no_answer", "remember")
         workflow.add_edge("social_response", "remember")
@@ -140,7 +143,14 @@ class RAGService:
 
     async def _classify(self, state: RAGState) -> dict:
         if self._is_common_pleasantry(state["question"]):
+            logger.info("Question routed without retrieval", extra={"route": "greeting"})
             return {"category": "greeting"}
+        if state["history"] and self._is_contextual_follow_up(state["question"]):
+            logger.info("Question routed by deterministic follow-up rule")
+            return {"category": "follow_up"}
+        if self._is_clear_policy_question(state["question"]):
+            logger.info("Question routed without classifier call", extra={"route": "policy"})
+            return {"category": "policy"}
         response = await self.model.ainvoke([
             ("system", self.prompts.render("classifier")),
             (
@@ -158,6 +168,7 @@ class RAGService:
             label = "policy"
         if label == "follow_up" and not state["history"]:
             label = "policy"
+        logger.info("Question classified", extra={"route": label})
         return {"category": label}
 
     @staticmethod
@@ -187,8 +198,9 @@ class RAGService:
 
     async def _retrieve(self, state: RAGState) -> dict:
         queries = state["queries"]
+        filters = infer_metadata_filters(state["question"])
         batches = await asyncio.gather(*(
-            asyncio.to_thread(self.retriever.search, query)
+            asyncio.to_thread(self.retriever.search, query, filters)
             for query in queries
         ))
         merged: dict[tuple[str, str, str], tuple[Document, float]] = {}
@@ -209,35 +221,12 @@ class RAGService:
             "confidence": max((score for _, score in results), default=0.0),
         }
 
-    async def _check_relevance(self, state: RAGState) -> dict:
-        relevant = [
-            (document, score)
-            for document, score in state["results"]
-            if score >= self.threshold
-        ]
-        if not relevant:
-            return {"sufficient": False}
-
-        response = await self.model.ainvoke([
-            ("system", self.prompts.render("evidence_relevance")),
-            (
-                "human",
-                f"Question: {state['question']}\n\nPolicy excerpts:\n{self._format_context(relevant)}",
-            ),
-        ])
-        sufficient = self._content(response).strip().upper() == "SUFFICIENT"
-        return {"sufficient": sufficient}
-
     async def _evaluate_and_generate(self, state: RAGState) -> dict:
-        relevance, answer = await asyncio.gather(
-            self._check_relevance(state),
-            self._generate_answer(state),
-        )
-        return {**relevance, **answer}
+        return await self._generate_answer(state)
 
     @staticmethod
-    def _route_relevance(state: RAGState) -> str:
-        if state["sufficient"]:
+    def _route_generation(state: RAGState) -> str:
+        if state["results"] and state["answer"]:
             return "verify"
         if state["retrieval_pass"] < 1:
             return "refine"
@@ -266,21 +255,22 @@ class RAGService:
         return {"queries": queries, "retrieval_pass": state["retrieval_pass"] + 1}
 
     async def _generate_answer(self, state: RAGState) -> dict:
-        relevant = [
-            (document, score)
-            for document, score in state["results"]
-            if score >= self.threshold
-        ]
+        relevant = state["results"]
         if not relevant:
             return {"answer": "", "sources": []}
+        history = state["history"]
+        memories = state["memories"]
+        if self._is_clear_policy_question(state["question"]):
+            history = []
+            memories = []
         response = await self.model.ainvoke([
             ("system", self.prompts.render("answer")),
             (
                 "human",
                 f"Recent conversation (context only; not policy evidence):\n"
-                f"{self._format_history(state['history']) or 'No earlier messages.'}"
+                f"{self._format_history(history) or 'No earlier messages.'}"
                 f"\n\nRelevant earlier conversation (context only; not policy evidence):\n"
-                f"{self._format_history(state['memories']) or 'No relevant earlier messages.'}"
+                f"{self._format_history(memories) or 'No relevant earlier messages.'}"
                 f"\n\nRetrieved policy excerpts:\n\n{self._format_context(relevant)}"
                 f"\n\nCurrent question: {state['question']}",
             ),
@@ -300,12 +290,9 @@ class RAGService:
         }
 
     async def _verify_grounding(self, state: RAGState) -> dict:
-        relevant = [
-            (document, score)
-            for document, score in state["results"]
-            if score >= self.threshold
-        ]
+        relevant = state["results"]
         if not self._citations_match_sources(state["answer"], state["sources"]):
+            logger.info("Grounding check failed", extra={"reason": "citation_mismatch"})
             return {"grounded": False}
         response = await self.model.ainvoke([
             ("system", self.prompts.render("grounding")),
@@ -315,7 +302,9 @@ class RAGService:
                 f"\n\nProposed answer:\n{state['answer']}",
             ),
         ])
-        return {"grounded": self._content(response).strip().upper() == "GROUNDED"}
+        grounded = self._content(response).strip().upper() == "GROUNDED"
+        logger.info("Grounding evaluated", extra={"grounded": grounded})
+        return {"grounded": grounded}
 
     @staticmethod
     def _citations_match_sources(
@@ -347,7 +336,11 @@ class RAGService:
 
     @staticmethod
     def _route_grounding(state: RAGState) -> str:
-        return "remember" if state["grounded"] else "no_answer"
+        if state["grounded"]:
+            return "remember"
+        if state["retrieval_pass"] < 1:
+            return "refine"
+        return "no_answer"
 
     async def _set_no_answer(self, state: RAGState) -> dict:
         return {"answer": NO_ANSWER, "confidence": 0.0, "sources": []}
@@ -385,19 +378,53 @@ class RAGService:
 
     @staticmethod
     def _is_common_pleasantry(question: str) -> bool:
-        normalized = " ".join(question.casefold().strip().rstrip("!.,?").split())
-        return normalized in {
-            "hi",
-            "hello",
-            "hey",
-            "good morning",
-            "good afternoon",
-            "good evening",
-            "thanks",
-            "thank you",
-            "bye",
-            "goodbye",
-        }
+        normalized = re.sub(r"[^\w\s']", " ", question.casefold())
+        normalized = " ".join(normalized.split())
+        return bool(
+            re.fullmatch(
+                r"(?:"
+                r"(?:hi|hello|hey|hiya|howdy)(?: (?:there|toucan|assistant|everyone))?"
+                r"|good (?:morning|afternoon|evening)(?: there)?"
+                r"|thanks?(?: a lot| so much| very much)?"
+                r"|thank you(?: so much| very much)?"
+                r"|how are you(?: doing)?"
+                r"|what'?s up"
+                r"|bye|goodbye|good bye|see you(?: later)?"
+                r")",
+                normalized,
+            )
+        )
+
+    @staticmethod
+    def _is_contextual_follow_up(question: str) -> bool:
+        normalized = " ".join(
+            re.sub(r"[^\w\s']", " ", question.casefold()).split()
+        )
+        return bool(
+            re.match(
+                r"^(?:and )?(?:what about|how about) (?:it|that|this|them|those|these)\b",
+                normalized,
+            )
+            or re.fullmatch(
+                r"(?:and )?(?:why|how|when|where|which one|which ones|tell me more|"
+                r"can you explain|what does that mean)(?: is it| about that)?",
+                normalized,
+            )
+        )
+
+    @staticmethod
+    def _is_clear_policy_question(question: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:merchant|card|payment|transaction|declined?|issuer|"
+                r"reason code|chargeback|dispute|refund|settlement|payout|"
+                r"fee|pricing|fraud|MCC|onboard(?:ing)?|offboard(?:ing)?|"
+                r"prohibited|restricted business|KYC|verification|"
+                r"code\s*\d{2,})\b",
+                question,
+                re.IGNORECASE,
+            )
+        )
 
     @staticmethod
     def _format_history(history: list[dict[str, str]]) -> str:
