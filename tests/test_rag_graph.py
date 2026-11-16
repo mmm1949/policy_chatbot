@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage
@@ -52,7 +53,7 @@ class FakeRetriever:
         self.queries: list[str] = []
 
     def search(
-        self, query: str, _filters: dict[str, str] | None = None
+        self, query: str, _metadata_hints: dict[str, str] | None = None
     ) -> list[tuple[Document, float]]:
         self.queries.append(query)
         if self.mode == "multi_hop" and query == "What is the account limit and payout limit?":
@@ -61,6 +62,21 @@ class FakeRetriever:
             return [(self._document("Payout limit policy"), 0.79)]
         if self.mode == "empty":
             return []
+        if self.mode == "two_sources":
+            return [
+                (self._document("Payout limit policy"), 0.82),
+                (
+                    Document(
+                        page_content="Uncited unrelated policy",
+                        metadata={
+                            "document_name": "other-policy.pdf",
+                            "page": 9,
+                            "source": "other-policy.pdf",
+                        },
+                    ),
+                    0.81,
+                ),
+            ]
         return [(self._document("Payout limit policy"), 0.82)]
 
     @staticmethod
@@ -73,33 +89,37 @@ class FakeRetriever:
 
 def make_service(
     retriever: FakeRetriever,
+    memory_database_path: Path,
     *,
     grounded: bool = True,
     answer: str | None = None,
 ) -> RAGService:
     service = RAGService(
-        Settings(groq_api_key="test-key"),
+        Settings(
+            groq_api_key="test-key",
+            memory_database_path=memory_database_path,
+        ),
         retriever,
     )
     service.model = FakeModel(grounded=grounded, answer=answer)
     return service
 
 
-def test_graph_generates_cited_answer_from_sufficient_evidence() -> None:
+def test_graph_generates_cited_answer_from_sufficient_evidence(tmp_path: Path) -> None:
     retriever = FakeRetriever()
-    service = make_service(retriever)
+    service = make_service(retriever, tmp_path / "memory.sqlite3")
 
     result = asyncio.run(service.answer("What is the payout limit?", "merchant-a"))
 
     assert result["answer"] == "The payout limit is $500 [limits.pdf, page 3]."
-    assert result["confidence"] == 0.82
+    assert result["reranker_score"] == 0.82
     assert result["sources"] == [{"document": "limits.pdf", "page": 3}]
     assert service.get_history("merchant-a")[-1]["content"] == result["answer"]
 
 
-def test_graph_refines_once_and_keeps_evidence_from_both_search_passes() -> None:
+def test_graph_refines_once_and_keeps_evidence_from_both_search_passes(tmp_path: Path) -> None:
     retriever = FakeRetriever(mode="multi_hop")
-    service = make_service(retriever)
+    service = make_service(retriever, tmp_path / "memory.sqlite3")
 
     result = asyncio.run(
         service.answer("What is the account limit and payout limit?", "merchant-a")
@@ -121,43 +141,55 @@ def test_graph_refines_once_and_keeps_evidence_from_both_search_passes() -> None
     assert "Payout limit policy" in grounding_calls[1]
 
 
-def test_unsupported_answer_is_replaced_with_fixed_no_answer() -> None:
-    service = make_service(FakeRetriever(), grounded=False)
+def test_unsupported_answer_is_replaced_with_fixed_no_answer(tmp_path: Path) -> None:
+    service = make_service(FakeRetriever(), tmp_path / "memory.sqlite3", grounded=False)
 
     result = asyncio.run(service.answer("What is the payout limit?", "merchant-a"))
 
-    assert result == {"answer": NO_ANSWER, "confidence": 0.0, "sources": []}
+    assert result == {"answer": NO_ANSWER, "reranker_score": 0.0, "sources": []}
 
 
-def test_answer_with_citation_not_in_retrieved_sources_is_rejected() -> None:
+def test_answer_with_citation_not_in_retrieved_sources_is_rejected(tmp_path: Path) -> None:
     service = make_service(
         FakeRetriever(),
+        tmp_path / "memory.sqlite3",
         answer="The payout limit is $500 [other-policy.pdf, page 9].",
     )
 
     result = asyncio.run(service.answer("What is the payout limit?", "merchant-a"))
 
-    assert result == {"answer": NO_ANSWER, "confidence": 0.0, "sources": []}
+    assert result == {"answer": NO_ANSWER, "reranker_score": 0.0, "sources": []}
     assert not any(
         "Check whether every factual claim" in system
         for system, _ in service.model.calls
     )
 
 
-def test_answer_with_unicode_citation_format_is_accepted() -> None:
+def test_answer_with_unicode_citation_format_is_accepted(tmp_path: Path) -> None:
     answer = "The payout limit is $500 【limits.pdf, page\u202f3】."
-    service = make_service(FakeRetriever(), answer=answer)
+    service = make_service(FakeRetriever(), tmp_path / "memory.sqlite3", answer=answer)
 
     result = asyncio.run(service.answer("What is the payout limit?", "merchant-a"))
 
     assert result["answer"] == answer
-    assert result["confidence"] == 0.82
+    assert result["reranker_score"] == 0.82
     assert result["sources"] == [{"document": "limits.pdf", "page": 3}]
 
 
-def test_follow_up_rewrite_uses_only_its_conversation_history() -> None:
+def test_sources_only_include_passages_cited_in_the_answer(tmp_path: Path) -> None:
+    service = make_service(
+        FakeRetriever(mode="two_sources"),
+        tmp_path / "memory.sqlite3",
+    )
+
+    result = asyncio.run(service.answer("What is the payout limit?", "merchant-a"))
+
+    assert result["sources"] == [{"document": "limits.pdf", "page": 3}]
+
+
+def test_follow_up_rewrite_uses_only_its_conversation_history(tmp_path: Path) -> None:
     retriever = FakeRetriever()
-    service = make_service(retriever)
+    service = make_service(retriever, tmp_path / "memory.sqlite3")
     asyncio.run(service.answer("What is the payout limit?", "merchant-a"))
 
     result = asyncio.run(service.answer("what about it?", "merchant-a"))
@@ -171,23 +203,23 @@ def test_follow_up_rewrite_uses_only_its_conversation_history() -> None:
     assert service.get_history("missing-conversation") == []
 
 
-def test_out_of_scope_message_uses_safe_fallback_without_retrieval() -> None:
+def test_out_of_scope_message_uses_safe_fallback_without_retrieval(tmp_path: Path) -> None:
     retriever = FakeRetriever()
-    service = make_service(retriever)
+    service = make_service(retriever, tmp_path / "memory.sqlite3")
 
     result = asyncio.run(service.answer("write me a poem", "merchant-a"))
 
-    assert result == {"answer": NO_ANSWER, "confidence": 0.0, "sources": []}
+    assert result == {"answer": NO_ANSWER, "reranker_score": 0.0, "sources": []}
     assert retriever.queries == []
 
 
-def test_empty_retrieval_uses_only_one_refinement_pass() -> None:
+def test_empty_retrieval_uses_only_one_refinement_pass(tmp_path: Path) -> None:
     retriever = FakeRetriever(mode="empty")
-    service = make_service(retriever)
+    service = make_service(retriever, tmp_path / "memory.sqlite3")
 
     result = asyncio.run(service.answer("What is the payout limit?", "merchant-a"))
 
-    assert result == {"answer": NO_ANSWER, "confidence": 0.0, "sources": []}
+    assert result == {"answer": NO_ANSWER, "reranker_score": 0.0, "sources": []}
     assert retriever.queries == [
         "What is the payout limit?",
         "account limit details",
@@ -195,35 +227,35 @@ def test_empty_retrieval_uses_only_one_refinement_pass() -> None:
     ]
 
 
-def test_greeting_path_does_not_search_policy_documents() -> None:
+def test_greeting_path_does_not_search_policy_documents(tmp_path: Path) -> None:
     retriever = FakeRetriever()
-    service = make_service(retriever)
+    service = make_service(retriever, tmp_path / "memory.sqlite3")
 
     result = asyncio.run(service.answer("hello", "merchant-a"))
 
     assert result == {
         "answer": "Hello! Ask me about merchant policies.",
-        "confidence": 0.0,
+        "reranker_score": 0.0,
         "sources": [],
     }
     assert retriever.queries == []
 
 
-def test_standalone_greeting_variants_skip_classifier_and_retrieval() -> None:
+def test_standalone_greeting_variants_skip_classifier_and_retrieval(tmp_path: Path) -> None:
     retriever = FakeRetriever()
-    service = make_service(retriever)
+    service = make_service(retriever, tmp_path / "memory.sqlite3")
 
     for index, greeting in enumerate(("Hi there!", "How are you?", "Thanks so much.")):
         result = asyncio.run(service.answer(greeting, f"greeting-{index}"))
-        assert result["confidence"] == 0.0
+        assert result["reranker_score"] == 0.0
         assert result["sources"] == []
 
     assert retriever.queries == []
     assert service.model.calls == []
 
 
-def test_direct_policy_question_is_not_reclassified_as_follow_up() -> None:
-    service = make_service(FakeRetriever())
+def test_direct_policy_question_is_not_reclassified_as_follow_up(tmp_path: Path) -> None:
+    service = make_service(FakeRetriever(), tmp_path / "memory.sqlite3")
     state = {
         "question": "A card was declined with code 59. Is that serious?",
         "history": [
@@ -239,8 +271,8 @@ def test_direct_policy_question_is_not_reclassified_as_follow_up() -> None:
     assert service.model.calls == []
 
 
-def test_repeated_policy_question_does_not_prompt_with_previous_no_answer() -> None:
-    service = make_service(FakeRetriever())
+def test_repeated_policy_question_does_not_prompt_with_previous_no_answer(tmp_path: Path) -> None:
+    service = make_service(FakeRetriever(), tmp_path / "memory.sqlite3")
 
     asyncio.run(
         service.answer(
@@ -258,8 +290,8 @@ def test_repeated_policy_question_does_not_prompt_with_previous_no_answer() -> N
     assert "No earlier messages." in answer_prompts[0]
 
 
-def test_contextual_follow_up_still_uses_conversation_history() -> None:
-    service = make_service(FakeRetriever())
+def test_contextual_follow_up_still_uses_conversation_history(tmp_path: Path) -> None:
+    service = make_service(FakeRetriever(), tmp_path / "memory.sqlite3")
     state = {
         "question": "What about that?",
         "history": [
@@ -275,9 +307,9 @@ def test_contextual_follow_up_still_uses_conversation_history() -> None:
     assert service.model.calls == []
 
 
-def test_greeting_with_policy_question_is_still_retrieved() -> None:
+def test_greeting_with_policy_question_is_still_retrieved(tmp_path: Path) -> None:
     retriever = FakeRetriever()
-    service = make_service(retriever)
+    service = make_service(retriever, tmp_path / "memory.sqlite3")
 
     asyncio.run(
         service.answer("Hi, what is the payout limit?", "greeting-policy")

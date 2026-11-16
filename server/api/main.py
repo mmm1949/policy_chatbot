@@ -1,8 +1,9 @@
 import logging
+import secrets
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from groq import APIConnectionError, APIStatusError
 
@@ -26,14 +27,22 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     knowledge_base = KnowledgeBase(settings)
-    if not knowledge_base.chunk_count:
-        try:
-            indexed = knowledge_base.index_if_empty()
-            logger.info("Indexed local policy documents on startup", extra={"chunks": indexed})
-        except ValueError as exc:
-            logger.warning("Policy knowledge base is empty", extra={"reason": str(exc)})
+    try:
+        indexed = knowledge_base.ensure_index_current()
+        logger.info("Policy knowledge base validated", extra={"chunks": indexed})
+    except ValueError as exc:
+        logger.warning("Policy knowledge base is empty", extra={"reason": str(exc)})
     app.state.knowledge_base = knowledge_base
     app.state.rag = RAGService(settings, knowledge_base.retriever)
+    if not settings.api_auth_token and settings.environment.casefold() in {
+        "development",
+        "dev",
+        "local",
+    }:
+        logger.warning(
+            "API authentication is disabled in development; "
+            "configure API_AUTH_TOKEN to enable it"
+        )
     yield
 
 
@@ -42,9 +51,33 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
+
+
+def require_api_token(
+    authorization: str | None = Header(default=None),
+) -> None:
+    if not settings.api_auth_token:
+        if settings.environment.casefold() in {"development", "dev", "local"}:
+            return
+        raise HTTPException(
+            status_code=503,
+            detail="API authentication is not configured. Set API_AUTH_TOKEN.",
+        )
+    scheme, separator, token = (authorization or "").partition(" ")
+    if (
+        scheme.casefold() != "bearer"
+        or not separator
+        or not token
+        or not secrets.compare_digest(token, settings.api_auth_token)
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="A valid bearer token is required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 @app.middleware("http")
@@ -68,14 +101,18 @@ async def health() -> HealthResponse:
     return HealthResponse(status="ok", service=settings.app_name)
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post(
+    "/chat",
+    response_model=ChatResponse,
+    dependencies=[Depends(require_api_token)],
+)
 async def chat(body: ChatRequest, request: Request) -> ChatResponse:
     conversation_id = body.conversation_id or new_conversation_id()
     try:
         result = await request.app.state.rag.answer(body.question, conversation_id)
         return ChatResponse(
             answer=result.get("answer", ""),
-            confidence=float(result.get("confidence", 0)),
+            reranker_score=float(result.get("reranker_score", 0)),
             sources=result.get("sources", []),
             conversation_id=conversation_id,
         )
@@ -107,7 +144,11 @@ async def chat(body: ChatRequest, request: Request) -> ChatResponse:
         ) from exc
 
 
-@app.get("/conversations/{conversation_id}", response_model=ConversationHistory)
+@app.get(
+    "/conversations/{conversation_id}",
+    response_model=ConversationHistory,
+    dependencies=[Depends(require_api_token)],
+)
 async def conversation_history(conversation_id: str, request: Request) -> ConversationHistory:
     return ConversationHistory(
         conversation_id=conversation_id,
@@ -115,18 +156,29 @@ async def conversation_history(conversation_id: str, request: Request) -> Conver
     )
 
 
-@app.delete("/conversations/{conversation_id}", status_code=204)
+@app.delete(
+    "/conversations/{conversation_id}",
+    status_code=204,
+    dependencies=[Depends(require_api_token)],
+)
 async def clear_conversation(conversation_id: str, request: Request) -> None:
     request.app.state.rag.clear_history(conversation_id)
 
 
-@app.get("/documents", response_model=list[DocumentInfo])
+@app.get(
+    "/documents",
+    response_model=list[DocumentInfo],
+    dependencies=[Depends(require_api_token)],
+)
 async def documents(request: Request) -> list[DocumentInfo]:
     knowledge_base: KnowledgeBase = request.app.state.knowledge_base
     return [DocumentInfo(**item) for item in knowledge_base.document_list()]
 
 
-@app.get("/documents/{document_name}/chunks")
+@app.get(
+    "/documents/{document_name}/chunks",
+    dependencies=[Depends(require_api_token)],
+)
 async def document_chunks(
     document_name: str,
     request: Request,

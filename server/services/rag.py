@@ -9,8 +9,7 @@ from langchain_groq import ChatGroq
 from langgraph.graph import END, START, StateGraph
 
 from config import Settings
-from retrieval.vector import VectorRetriever
-from retrieval.vector import infer_metadata_filters
+from retrieval.vector import VectorRetriever, infer_metadata_hints
 from services.memory import ConversationMemory
 from services.prompts import PromptManager
 
@@ -37,7 +36,7 @@ class RAGState(TypedDict, total=False):
     queries: list[str]
     retrieval_pass: int
     results: list[tuple[Document, float]]
-    confidence: float
+    reranker_score: float
     grounded: bool
     answer: str
     sources: list[SourceReference]
@@ -45,7 +44,7 @@ class RAGState(TypedDict, total=False):
 
 class RAGResult(TypedDict):
     answer: str
-    confidence: float
+    reranker_score: float
     sources: list[SourceReference]
 
 
@@ -123,12 +122,12 @@ class RAGService:
             "queries": [question],
             "retrieval_pass": 0,
             "results": [],
-            "confidence": 0.0,
+            "reranker_score": 0.0,
             "sources": [],
         })
         return {
             "answer": state["answer"],
-            "confidence": state["confidence"],
+            "reranker_score": state["reranker_score"],
             "sources": state["sources"],
         }
 
@@ -198,9 +197,9 @@ class RAGService:
 
     async def _retrieve(self, state: RAGState) -> dict:
         queries = state["queries"]
-        filters = infer_metadata_filters(state["question"])
+        metadata_hints = infer_metadata_hints(state["question"])
         batches = await asyncio.gather(*(
-            asyncio.to_thread(self.retriever.search, query, filters)
+            asyncio.to_thread(self.retriever.search, query, metadata_hints)
             for query in queries
         ))
         merged: dict[tuple[str, str, str], tuple[Document, float]] = {}
@@ -218,7 +217,7 @@ class RAGService:
         results = sorted(merged.values(), key=lambda item: item[1], reverse=True)
         return {
             "results": results,
-            "confidence": max((score for _, score in results), default=0.0),
+            "reranker_score": max((score for _, score in results), default=0.0),
         }
 
     async def _evaluate_and_generate(self, state: RAGState) -> dict:
@@ -275,18 +274,19 @@ class RAGService:
                 f"\n\nCurrent question: {state['question']}",
             ),
         ])
-        sources = []
+        answer = self._content(response)
+        available_sources = []
         seen_sources = set()
         for document, _ in relevant:
             name = str(document.metadata.get("document_name") or document.metadata.get("source") or "Unknown")
             page = document.metadata.get("page")
             key = (name, page)
             if key not in seen_sources:
-                sources.append({"document": name, "page": page})
+                available_sources.append({"document": name, "page": page})
                 seen_sources.add(key)
         return {
-            "answer": self._content(response),
-            "sources": sources,
+            "answer": answer,
+            "sources": self._cited_sources(answer, available_sources),
         }
 
     async def _verify_grounding(self, state: RAGState) -> dict:
@@ -307,10 +307,7 @@ class RAGService:
         return {"grounded": grounded}
 
     @staticmethod
-    def _citations_match_sources(
-        answer: str,
-        sources: list[SourceReference],
-    ) -> bool:
+    def _parsed_citations(answer: str) -> list[tuple[str, int | None] | None]:
         normalized_answer = answer.translate(str.maketrans({
             "【": "[",
             "】": "]",
@@ -319,20 +316,42 @@ class RAGService:
         }))
         normalized_answer = re.sub(r"\s+", " ", normalized_answer)
         citations = re.findall(r"\[([^\[\]]+)\]", normalized_answer)
-        if not citations:
-            return False
-        available = {
-            (str(source["document"]), str(source["page"]) if source["page"] is not None else None)
-            for source in sources
-        }
+        parsed: list[tuple[str, int | None] | None] = []
         for citation in citations:
             name, separator, page_text = citation.strip().rpartition(", page ")
             if separator:
-                if not page_text.isdigit() or (name, page_text) not in available:
-                    return False
-            elif (citation, None) not in available:
-                return False
-        return True
+                parsed.append((name, int(page_text)) if page_text.isdigit() else None)
+            else:
+                parsed.append((citation.strip(), None))
+        return parsed
+
+    @classmethod
+    def _cited_sources(
+        cls,
+        answer: str,
+        sources: list[SourceReference],
+    ) -> list[SourceReference]:
+        cited = set(cls._parsed_citations(answer))
+        cited.discard(None)
+        return [
+            source for source in sources
+            if (str(source["document"]), source["page"]) in cited
+        ]
+
+    @classmethod
+    def _citations_match_sources(
+        cls,
+        answer: str,
+        sources: list[SourceReference],
+    ) -> bool:
+        citations = cls._parsed_citations(answer)
+        if not citations or any(citation is None for citation in citations):
+            return False
+        available = {
+            (str(source["document"]), source["page"])
+            for source in sources
+        }
+        return all(citation in available for citation in citations if citation is not None)
 
     @staticmethod
     def _route_grounding(state: RAGState) -> str:
@@ -343,13 +362,13 @@ class RAGService:
         return "no_answer"
 
     async def _set_no_answer(self, state: RAGState) -> dict:
-        return {"answer": NO_ANSWER, "confidence": 0.0, "sources": []}
+        return {"answer": NO_ANSWER, "reranker_score": 0.0, "sources": []}
 
     async def _social_response(self, state: RAGState) -> dict:
         if self._is_common_pleasantry(state["question"]):
             return {
                 "answer": "Hello! Ask me about merchant policies.",
-                "confidence": 0.0,
+                "reranker_score": 0.0,
                 "sources": [],
             }
         response = await self.model.ainvoke([
@@ -362,7 +381,7 @@ class RAGService:
         ])
         return {
             "answer": self._content(response),
-            "confidence": 0.0,
+            "reranker_score": 0.0,
             "sources": [],
         }
 

@@ -1,15 +1,18 @@
 from pathlib import Path
 
 from langchain_core.documents import Document
+from pydantic import ValidationError
+import pytest
 
+from config import Settings
 from ingestion.chunker import split_documents, split_parent_documents
 from retrieval.parent_store import ParentDocumentStore
 from retrieval.vector import (
     VectorRetriever,
-    _matches_filters,
-    _where_filter,
-    infer_metadata_filters,
+    _metadata_match_ratio,
+    infer_metadata_hints,
 )
+from services.knowledge_base import KnowledgeBase
 
 
 class FakeCollection:
@@ -60,6 +63,13 @@ class FakeReranker:
         return scores
 
 
+class ConstantReranker:
+    def predict(
+        self, pairs: list[tuple[str, str]], show_progress_bar: bool = False
+    ) -> list[float]:
+        return [0.5] * len(pairs)
+
+
 class FakeParentStore:
     def __init__(self, documents: dict[str, Document]) -> None:
         self.documents = documents
@@ -94,33 +104,97 @@ def _chunk(
     )
 
 
-def test_query_infers_region_policy_and_payment_filters() -> None:
-    filters = infer_metadata_filters(
+def test_query_infers_region_policy_and_payment_hints() -> None:
+    hints = infer_metadata_hints(
         "What is the chargeback reason code for card payments in India?"
     )
 
-    assert filters == {
+    assert hints == {
         "region": "India",
         "policy_type": "disputes",
         "payment_method": "card",
     }
-    where = _where_filter(filters)
-    assert where is not None
-    assert _matches_filters(
-        {"region": "unspecified", "policy_type": "general", "payment_method": "unspecified"},
-        filters,
+    assert _metadata_match_ratio(
+        {"region": "India", "policy_type": "disputes", "payment_method": "card"},
+        hints,
+    ) == 1
+    assert _metadata_match_ratio(
+        {"region": "unspecified", "policy_type": "fees"},
+        hints,
+    ) == 0
+
+
+def test_metadata_hints_do_not_filter_out_missing_metadata() -> None:
+    document = Document(
+        page_content="Refunds are processed to the original payment method.",
+        metadata={"chunk_id": "old-chunk"},
     )
-    assert not _matches_filters(
-        {"region": "United States", "policy_type": "disputes", "payment_method": "card"},
-        filters,
+    vector_store = FakeVectorStore(
+        [("old-chunk", document)],
+        [(document, 0.1)],
     )
+    retriever = VectorRetriever(vector_store, candidate_k=3)
+    retriever._reranker = FakeReranker()
+
+    results = retriever.search(
+        "What is the refund policy for card payments?",
+        {"policy_type": "refunds", "payment_method": "card"},
+    )
+
+    assert vector_store.where is None
+    assert results == [(document, 0.1)]
+
+
+def test_misclassified_document_remains_searchable() -> None:
+    document = Document(
+        page_content="Onboarding requirements mention chargebacks as a risk control.",
+        metadata={"chunk_id": "onboarding", "policy_type": "disputes"},
+    )
+    vector_store = FakeVectorStore(
+        [("onboarding", document)],
+        [(document, 0.1)],
+    )
+    retriever = VectorRetriever(vector_store, candidate_k=3)
+    retriever._reranker = FakeReranker()
+
+    results = retriever.search(
+        "What are the onboarding requirements?",
+        {"policy_type": "onboarding"},
+    )
+
+    assert results == [(document, 0.8)]
+
+
+def test_metadata_match_boosts_final_rank_without_excluding_mismatches() -> None:
+    mismatched = Document(
+        page_content="common onboarding requirements",
+        metadata={"chunk_id": "mismatch", "policy_type": "disputes"},
+    )
+    matched = Document(
+        page_content="common onboarding requirements",
+        metadata={"chunk_id": "match", "policy_type": "onboarding"},
+    )
+    vector_store = FakeVectorStore(
+        [("mismatch", mismatched), ("match", matched)],
+        [(mismatched, 0.1), (matched, 0.1)],
+    )
+    retriever = VectorRetriever(vector_store, candidate_k=3)
+    retriever._reranker = ConstantReranker()
+
+    results = retriever.search(
+        "common onboarding",
+        {"policy_type": "onboarding"},
+    )
+
+    assert [document for document, _ in results] == [matched, mismatched]
+    assert vector_store.where is None
 
 
 def test_hybrid_search_fuses_ranks_and_returns_parent_documents() -> None:
     chunks = [
         _chunk("chunk-1", "parent-1", "chargeback reason code 4837 card", "India", "disputes", "card"),
         _chunk("chunk-2", "parent-2", "irrelevant settlement information", "India", "disputes", "card"),
-        _chunk("chunk-3", "parent-3", "chargeback details code 4837", "unspecified", "general", "unspecified"),
+        _chunk("chunk-3", "parent-3", "chargeback details", "unspecified", "general", "unspecified"),
     ]
     corpus = list(zip(("chunk-1", "chunk-2", "chunk-3"), chunks))
     vector_store = FakeVectorStore(corpus, [(chunks[1], 0.1), (chunks[0], 0.2)])
@@ -145,14 +219,90 @@ def test_hybrid_search_fuses_ranks_and_returns_parent_documents() -> None:
 
     results = retriever.search(
         "chargeback reason code 4837 card payments in India",
-        infer_metadata_filters("chargeback reason code 4837 card payments in India"),
+        infer_metadata_hints("chargeback reason code 4837 card payments in India"),
     )
 
-    assert vector_store.where is not None
+    assert vector_store.where is None
     assert results == [
         (parent_store.documents["parent-1"], 0.9),
         (parent_store.documents["parent-3"], 0.8),
     ]
+
+
+def test_relevance_threshold_filters_reranker_results() -> None:
+    document = _chunk(
+        "chunk-1",
+        "parent-1",
+        "chargeback reason code 4837",
+        "India",
+        "disputes",
+        "card",
+    )
+    vector_store = FakeVectorStore(
+        [("chunk-1", document)],
+        [(document, 0.1)],
+    )
+    retriever = VectorRetriever(
+        vector_store,
+        candidate_k=3,
+        relevance_threshold=0.95,
+    )
+    retriever._reranker = FakeReranker()
+
+    assert retriever.search("chargeback reason code 4837") == []
+
+
+def test_relevance_threshold_is_optional_and_must_be_finite() -> None:
+    assert Settings(_env_file=None, relevance_threshold=0.72).relevance_threshold == 0.72
+    assert Settings(_env_file=None).relevance_threshold is None
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, relevance_threshold=float("nan"))
+
+
+def test_nonempty_index_with_missing_metadata_is_rebuilt() -> None:
+    old_document = Document(
+        page_content="legacy chunk",
+        metadata={"chunk_id": "legacy"},
+    )
+    knowledge_base = object.__new__(KnowledgeBase)
+    knowledge_base.vector_store = FakeVectorStore(
+        [("legacy", old_document)],
+        [],
+    )
+    knowledge_base.parent_store = FakeParentStore({})
+    reindexed: list[bool] = []
+    knowledge_base.index_directory = lambda: reindexed.append(True) or 54
+
+    assert knowledge_base.ensure_index_current() == 54
+    assert reindexed == [True]
+
+
+def test_current_index_is_reused_without_reindexing() -> None:
+    document = _chunk(
+        "chunk-1",
+        "parent-1",
+        "Current indexed chunk",
+        "unspecified",
+        "general",
+        "unspecified",
+    )
+    knowledge_base = object.__new__(KnowledgeBase)
+    knowledge_base.vector_store = FakeVectorStore(
+        [("chunk-1", document)],
+        [],
+    )
+    knowledge_base.parent_store = FakeParentStore({
+        "parent-1": Document(
+            page_content="Current parent",
+            metadata={"parent_id": "parent-1"},
+        ),
+    })
+    knowledge_base.index_directory = lambda: (_ for _ in ()).throw(
+        AssertionError("A current index should not be rebuilt.")
+    )
+
+    assert knowledge_base.ensure_index_current() == 1
 
 
 def test_parent_splitting_keeps_table_intact_and_links_child_chunks() -> None:

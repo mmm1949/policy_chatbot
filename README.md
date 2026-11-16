@@ -6,7 +6,34 @@ augmented generation (RAG) application; then a more capable conversational
 workflow with persistent memory, managed prompts, and latency improvements.
 
 This README explains both stages and documents how to configure, run, and
-maintain the current application.
+maintain the current application. See
+[PROJECT_ISSUES_AND_FIXES.md](./PROJECT_ISSUES_AND_FIXES.md) for issue-by-issue
+explanations and the implementation status.
+
+## Fixes made in this update
+
+- Startup validates populated Chroma indexes and rebuilds them when chunk
+  metadata or parent records are missing.
+- Query-inferred metadata provides a soft ranking boost instead of hard
+  filtering retrieval candidates.
+- `RELEVANCE_THRESHOLD` is a typed optional setting and, when configured,
+  filters using the raw reranker score.
+- The API response now uses `reranker_score` instead of calling the value
+  “confidence”; the UI displays it as a score, not a probability.
+- `sources` contains only the document/page references cited in the validated
+  answer.
+- Chat, conversation, and document-inspection routes require a bearer token
+  when configured; tokenless local development logs a warning, and `/health`
+  remains public.
+- RAG tests use temporary SQLite memory databases.
+- Compose reads server variables from `server/.env`, and the client image uses
+  the existing `client/app.py` entrypoint.
+- Added a 25-question evaluation set in
+  [RETRIEVAL_EVALUATION.md](./RETRIEVAL_EVALUATION.md). The reported 15/53
+  fallback rate is historical and is not a controlled benchmark result.
+- Recorded a live 25-question evaluation matrix in
+  [RETRIEVAL_EVALUATION_RESULTS.md](./RETRIEVAL_EVALUATION_RESULTS.md); the
+  pre-fix run and effective API settings are still unavailable.
 
 ## Development updates
 
@@ -78,7 +105,7 @@ Chat message
   -> assess evidence and draft an answer concurrently
   -> optionally refine retrieval once
   -> verify evidence and citations
-  -> save the exchange and return answer, confidence, and sources
+  -> save the exchange and return answer, reranker score, and cited sources
 ```
 
 The Streamlit client sends chat requests to the FastAPI server. LangGraph
@@ -112,9 +139,9 @@ project's indexed policy documents. Its major capabilities include:
   candidates and returns up to 5.
 
 - **Metadata-aware search:** Adds document name, policy type, region, version,
-  effective date, and payment-method metadata during indexing. Supported
-  filters are inferred from the user's query and applied before fusion;
-  unspecified metadata remains eligible as a fallback.
+  effective date, and payment-method metadata during indexing. Query-inferred
+  metadata is a ranking hint, not a hard filter, so missing or imperfect labels
+  do not exclude otherwise relevant passages.
 
 - **Parent-section and table retrieval:** Matches small searchable chunks but
   returns their stored parent sections. Extracted tables are kept whole so
@@ -131,8 +158,9 @@ project's indexed policy documents. Its major capabilities include:
 
 - **Web interface and API:** Provides a Streamlit chat UI and a FastAPI backend
   for chat, conversation history, document listings, and indexed-chunk
-  inspection. Answers include source/page citations and a retrieval confidence
-  score.
+  inspection. Protected routes require a bearer token when one is configured;
+  tokenless development mode is logged. Answers include source/page citations
+  and a raw reranker score, not a calibrated confidence.
 
 The application uses Groq for chat-model tasks. Sentence-transformer embeddings,
 BM25 search, and cross-encoder reranking run locally; the reranker uses CUDA
@@ -196,12 +224,10 @@ type, region, document version, effective date, and payment method. The indexer
 infers these tags from document names and text. It recognizes explicit version
 labels and ISO effective dates; missing or ambiguous values are marked
 `unspecified`. Query-time rules detect supported policy types, regions, payment
-methods, explicit version numbers, and ISO effective dates. Those filters are
-applied to both the Chroma vector search and the BM25 candidate set before
-fusion. Documents tagged `unspecified` (and general policy documents where
-appropriate) remain eligible, so incomplete source metadata does not silently
-remove otherwise useful evidence. This is rule-based metadata inference, not an
-LLM-selected search router.
+methods, explicit version numbers, and ISO effective dates. Matching metadata
+provides a small ranking boost after broad vector and BM25 retrieval; it never
+excludes a passage just because its metadata is missing or imperfect. This is
+rule-based metadata inference, not an LLM-selected search router.
 
 The BM25 and vector result lists are fused by Reciprocal Rank Fusion (RRF) with
 the configurable `RRF_CONSTANT` (default `60`). A local BGE cross-encoder then
@@ -214,13 +240,12 @@ surrounding table context. Parent text is stored in
 The first chat request downloads the configured cross-encoder model if it is
 not already cached. `RERANKER_DEVICE=auto` uses CUDA when available and CPU
 otherwise; set `RERANKER_MODEL` to another compatible Sentence Transformers
-cross-encoder when needed. Metadata inference
-is deliberately conservative: if a document mentions multiple regions or
-payment methods, the tag is `unspecified`. For accurate region/version/date
-filtering, make those values explicit in the source documents. Existing
-vector-only collections are refreshed from the source documents on API startup
-when the required hybrid-search metadata is absent; the CLI indexing command
-also rebuilds the collection.
+cross-encoder when needed. Metadata inference is deliberately conservative: if
+a document mentions multiple regions or payment methods, the tag is
+`unspecified`. For accurate ranking, make those values explicit in the source
+documents. Startup validates all chunk metadata and parent references and
+rebuilds incomplete indexes even when they are nonempty; the CLI indexing
+command also rebuilds the collection.
 ## Features
 
 ### Policy knowledge base
@@ -247,9 +272,8 @@ also rebuilds the collection.
   queries.
 - Returns the configured no-answer response when evidence is missing,
   insufficient, or fails grounding validation.
-- Returns answer confidence and source/page citations. Confidence is the
-  highest retrieved-chunk similarity for a grounded answer; it is a retrieval
-  score, not a calibrated probability.
+- Returns the raw reranker score and cited source/page references. The score is
+  not a calibrated probability.
 
 ### Prompt and response management
 
@@ -323,8 +347,8 @@ request if not already cached. The generated Chroma database is stored in
 `server/data/chroma/` by default. Re-run the indexing command after adding,
 removing, or changing source documents; the command updates the collection from
 the files in `server/data/documents/`. The server also automatically indexes
-source files at startup if the Chroma collection is empty or lacks the
-metadata/parent records required by hybrid retrieval.
+source files at startup whenever the collection is empty or any stored chunk
+metadata or parent reference is incomplete.
 
 ### 3. Start the API and client
 
@@ -333,6 +357,7 @@ In the first PowerShell terminal, from the project root:
 ```powershell
 .\.venv\Scripts\Activate.ps1
 $env:PYTHONPATH = "server"
+$env:API_AUTH_TOKEN = "set-a-long-random-token"
 python -m uvicorn api.main:app --reload
 ```
 
@@ -341,7 +366,8 @@ In a second terminal:
 ```powershell
 .\.venv\Scripts\Activate.ps1
 $env:POLICY_API_URL = "http://localhost:8000"
-python -m streamlit run client\streamlit_app.py
+$env:POLICY_API_TOKEN = "set-the-same-token-used-by-the-api"
+python -m streamlit run client\app.py
 ```
 
 Open `http://localhost:8501` to use the chatbot. The API is available at
@@ -365,13 +391,21 @@ Open `http://localhost:8501` to use the chatbot. The API is available at
 | `RRF_CONSTANT` | Reciprocal Rank Fusion smoothing constant | `60` |
 | `RERANKER_MODEL` | Local Sentence Transformers cross-encoder | `BAAI/bge-reranker-base` |
 | `RERANKER_DEVICE` | Reranker execution device (`auto`, `cpu`, or `cuda`) | `auto` |
+| `RELEVANCE_THRESHOLD` | Optional minimum raw reranker score; unset disables score filtering | Unset |
+| `API_AUTH_TOKEN` | Bearer token required by protected API routes | Optional in development; required outside development |
 | `CORS_ORIGINS` | Allowed browser origins | `http://localhost:8501` |
 | `POLICY_API_URL` | API URL used by the Streamlit client | `http://localhost:8000` |
+| `POLICY_API_TOKEN` | Bearer token sent by the Streamlit client | Must match `API_AUTH_TOKEN` |
 
 Settings can be provided through environment variables. In development, the
 server loads the project-root `.env` file and also supports `server/.env`.
 Deployment environments should provide secrets through environment variables
-or a secret manager.
+or a secret manager. Set `API_AUTH_TOKEN` for the API process and
+`POLICY_API_TOKEN` for the Streamlit process to the same long random value.
+When no token is configured, local development allows requests without bearer
+authentication and logs a warning; outside development, protected API routes
+return HTTP 503 until `API_AUTH_TOKEN` is configured. If a token is configured,
+it is required in every environment.
 
 The source files are the durable originals; Chroma stores the indexed chunks and
 embeddings, and the adjacent SQLite database stores parent sections and tables.
@@ -409,20 +443,32 @@ Example chat request:
 }
 ```
 
-The response contains `answer`, `confidence`, `sources`, and
+The response contains `answer`, `reranker_score`, `sources`, and
 `conversation_id`. If no conversation ID is supplied, the API creates one.
-Chat responses include `answer`, `confidence`, `sources`, and
+Chat responses include `answer`, `reranker_score`, `sources`, and
 `conversation_id`. If retrieval returns no evidence or the answer fails
 grounding verification after its bounded refinement pass, the API returns the
 configured no-answer message instead of presenting an unsupported answer. The
 refinement is bounded to one extra pass with at most two additional search
 queries.
 
+All routes except `GET /health` require
+`Authorization: Bearer <API_AUTH_TOKEN>`. This shared-token mechanism is
+intended for a private deployment; it does not identify individual users. Add
+an identity provider and per-user conversation ownership before using this as
+a multi-user service.
 
 ## Docker
 
-Configure `.env`, place policy files in `server/data/documents/`, then index
-and start the services from the project root:
+Copy `.env.example` to the project-root `.env` and replace the
+`API_AUTH_TOKEN` placeholder with a long random token. Keep the file private
+and uncommitted. Compose reads server variables from `server/.env`; the root
+`.env` supplies the shared token to both containers. For a token-protected
+Compose deployment, set `API_AUTH_TOKEN` in the root `.env`. If no token is
+configured, development mode permits local requests without bearer
+authentication, while other environments reject protected requests. Place
+policy files in `server/data/documents/`, then index and start the services
+from the project root:
 
 ```powershell
 docker compose run --build --rm server python -m ingestion.index_documents
@@ -455,7 +501,7 @@ python -m pytest tests
 - Conversation recall uses bounded SQLite history and term overlap. It is
   conversation context, not a separate vector memory or a source of policy
   facts.
-- Confidence is based on retrieved-chunk similarity and should not be read as a
+- `reranker_score` is a raw cross-encoder score and should not be read as a
   calibrated probability.
 
 For detailed internals, see [BACKEND_ARCHITECTURE.md](./BACKEND_ARCHITECTURE.md)

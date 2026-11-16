@@ -63,7 +63,7 @@ state.
 
 The graph state contains the current question and conversation ID, bounded
 history, query category, search query or refinement queries, retrieval pass
-number, retrieved `(Document, similarity)` results, confidence, evidence and
+number, retrieved `(Document, similarity)` results, reranker score, evidence and
 grounding decisions, final answer, and citations. No retrieved context or policy
 facts are loaded from conversation history.
 
@@ -81,11 +81,11 @@ facts are loaded from conversation history.
 3. **`rewrite`** runs only for follow-ups. It converts the latest question into
    a standalone search query using recent messages to resolve references.
    Otherwise, the original question is searched.
-4. **`retrieve`** infers supported metadata filters from the original question,
-   applies them to BM25 and vector search, fuses the two rankings with RRF, and
-   reranks the candidate pool. It returns matching parent sections or complete
-   tables. For refinement queries, it merges duplicate sources and keeps the
-   highest reranker score.
+4. **`retrieve`** infers supported metadata hints from the original question,
+   runs broad BM25 and vector search, gives metadata matches a soft ranking
+   boost, fuses the rankings with RRF, and reranks the candidate pool. It
+   returns matching parent sections or complete tables. For refinement queries,
+   it merges duplicate sources and keeps the highest reranker score.
 5. **`evaluate_and_generate`** drafts an answer from the reranked excerpts.
    Empty retrieval skips generation and proceeds to refinement or fallback.
 6. **`verify_grounding`** checks that factual claims are supported by excerpts
@@ -134,10 +134,11 @@ valid refinement query, retrieval yields no additional evidence and the
 workflow reaches the fixed fallback. Groq/provider errors propagate to the API
 error handler rather than being converted into a successful-looking answer.
 
-The returned confidence is the highest cross-encoder score among retrieved
-evidence for a grounded answer. It is a ranking score, not a calibrated
-probability. Greeting responses and fallback answers have confidence `0.0` and
-no citations.
+The returned `reranker_score` is the highest raw cross-encoder score among
+retrieved evidence for a grounded answer. It is a ranking score, not a
+calibrated probability. Greeting responses and fallback answers have a score
+of `0.0` and no citations. `RELEVANCE_THRESHOLD`, when set, filters results
+against that raw score; calibrate it on representative questions before use.
 
 ## 4. Request lifecycle and API
 
@@ -149,16 +150,21 @@ python -m uvicorn api.main:app --reload
 ```
 
 At startup, the FastAPI lifespan handler creates the knowledge base, opens
-Chroma, and indexes local policy documents if the collection is empty or lacks
-the current hybrid-search metadata. It then constructs `RAGService` and its
-compiled graph. `GROQ_API_KEY` must be configured for chat generation.
-Embeddings and reranking run locally.
+Chroma, and validates the whole collection and its parent records. It indexes
+the local policy documents if the collection is empty or incomplete, even when
+it already contains chunks. It then constructs `RAGService` and its compiled
+graph. `GROQ_API_KEY` must be configured for chat generation. Embeddings and
+reranking run locally.
 
 `POST /chat` validates the question, uses a supplied conversation ID or creates
-a UUID, invokes the graph, and returns `answer`, `confidence`, `sources`, and
+a UUID, invokes the graph, and returns `answer`, `reranker_score`, `sources`, and
 `conversation_id`. Existing conversation IDs select only that conversation's
 recent messages for follow-up context. API failures are logged and mapped to
 HTTP errors by `server/api/main.py`.
+
+All routes except `GET /health` require the configured bearer token. This is a
+shared-token gate for a private deployment, not per-user identity or
+conversation ownership.
 
 | Method and path | Purpose |
 |---|---|
@@ -174,7 +180,7 @@ The answer format is:
 ```json
 {
   "answer": "The policy says ... [settlements.pdf, page 2]",
-  "confidence": 0.82,
+  "reranker_score": 0.82,
   "sources": [
     {
       "document": "settlements.pdf",
@@ -215,9 +221,9 @@ The indexer recursively loads supported files, creates parent sections and
 whole-table records, then splits them into smaller searchable chunks. Each
 chunk stores a parent ID, and complete parents are persisted in
 `server/data/chroma/parents.sqlite3`. Chunks are embedded locally and written to
-the Chroma collection `merchant_policy_rag`. At query time, BM25 and vector
-results are filtered by inferred metadata, fused with RRF, then reranked by a
-local BGE cross-encoder. A successful reindex reconciles the collection with
+the Chroma collection `merchant_policy_rag`. At query time, BM25 and vector results are retrieved without inferred hard
+filters; metadata matches provide a soft boost before RRF fusion and reranking
+by a local BGE cross-encoder. A successful reindex reconciles the collection with
 the current source directory. Run it after adding, changing, or removing policy
 sources:
 
@@ -251,8 +257,11 @@ Streamlit client or commit it.
 | `RRF_CONSTANT` | `60` | Reciprocal Rank Fusion smoothing constant. |
 | `RERANKER_MODEL` | `BAAI/bge-reranker-base` | Local Sentence Transformers cross-encoder. |
 | `RERANKER_DEVICE` | `auto` | Reranker execution device: `auto`, `cpu`, or `cuda`. |
+| `RELEVANCE_THRESHOLD` | Unset | Optional minimum raw reranker score; unset disables score filtering. |
+| `API_AUTH_TOKEN` | Empty | Bearer token required for protected API routes. |
 | `CORS_ORIGINS` | `http://localhost:8501` | Comma-separated allowed origins. |
 | `POLICY_API_URL` | `http://localhost:8000` | Streamlit API base URL. |
+| `POLICY_API_TOKEN` | Empty | Streamlit bearer token; must match `API_AUTH_TOKEN`. |
 
 ## 8. Running and validation
 
@@ -270,7 +279,8 @@ Run the Streamlit client in a second terminal:
 
 ```powershell
 $env:POLICY_API_URL = "http://localhost:8000"
-python -m streamlit run client\streamlit_app.py
+$env:POLICY_API_TOKEN = "same-token-as-API_AUTH_TOKEN"
+python -m streamlit run client\app.py
 ```
 
 Docker Compose builds the server from `server/Dockerfile`, uses a named volume
@@ -288,5 +298,5 @@ The LangGraph tests cover grounded answers, bounded multi-query refinement,
 grounding rejection, follow-up rewriting, and conversation isolation. Hybrid
 retrieval tests cover metadata inference, fusion/reranking, and parent records.
 If the server returns an unexpected fallback, check source extraction and
-reindexing, metadata filters, reranker output, and the evidence-check decisions
-in `server/services/rag.py`.
+reindexing, metadata ranking hints, the configured reranker threshold, and the
+evidence-check decisions in `server/services/rag.py`.

@@ -3,8 +3,9 @@ services:
     build:
       context: ./server
     env_file:
-      - .env
+      - ./server/.env
     environment:
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN:-}
       CHROMA_PERSIST_DIRECTORY: /app/data/chroma
       DOCUMENT_DIRECTORY: /app/data/documents
       MEMORY_DATABASE_PATH: /app/data/memory/conversations.sqlite3
@@ -25,6 +26,7 @@ services:
       context: ./client
     environment:
       POLICY_API_URL: http://server:8000
+      POLICY_API_TOKEN: ${API_AUTH_TOKEN:-}
     ports:
       - "8501:8501"
     depends_on:

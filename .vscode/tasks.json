@@ -1,0 +1,12 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Start policy API for benchmark retries",
+			"type": "shell",
+			"command": "Set-Location -LiteralPath 'C:\\Users\\manikanta.meesala\\GitHub\\policy_chatbot'; $env:PYTHONPATH = 'server'; & 'C:\\Users\\manikanta.meesala\\GitHub\\policy_chatbot\\server\\.venv\\Scripts\\python.exe' -m uvicorn api.main:app --host 127.0.0.1 --port 8000",
+			"isBackground": true,
+			"problemMatcher": []
+		}
+	]
+}

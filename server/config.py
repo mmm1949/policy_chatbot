@@ -1,4 +1,5 @@
 from functools import lru_cache
+import math
 import os
 from pathlib import Path
 
@@ -23,6 +24,7 @@ class Settings(BaseSettings):
     environment: str = ENVIRONMENT
     log_level: str = "INFO"
     groq_api_key: str = ""
+    api_auth_token: str = ""
     groq_model: str = "openai/gpt-oss-120b"
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     prompt_version: str = "v1"
@@ -36,6 +38,7 @@ class Settings(BaseSettings):
     rrf_constant: int = 60
     reranker_model: str = "BAAI/bge-reranker-base"
     reranker_device: str = "auto"
+    relevance_threshold: float | None = None
     cors_origins: str = "http://localhost:8501"
 
     @field_validator(
@@ -48,6 +51,13 @@ class Settings(BaseSettings):
     def resolve_data_path(cls, value: str | Path) -> Path:
         path = Path(value).expanduser()
         return path if path.is_absolute() else PROJECT_ROOT / path
+
+    @field_validator("relevance_threshold")
+    @classmethod
+    def validate_relevance_threshold(cls, value: float | None) -> float | None:
+        if value is not None and not math.isfinite(value):
+            raise ValueError("RELEVANCE_THRESHOLD must be a finite number.")
+        return value
 
     @property
     def allowed_origins(self) -> list[str]:

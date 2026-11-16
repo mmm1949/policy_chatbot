@@ -40,16 +40,18 @@ class KnowledgeBase:
             reranker_device=settings.reranker_device,
             rrf_constant=settings.rrf_constant,
             parent_store=self.parent_store,
+            relevance_threshold=settings.relevance_threshold,
         )
 
     @property
     def chunk_count(self) -> int:
         return self.vector_store._collection.count()
 
-    def index_if_empty(self) -> int:
-        if self.chunk_count:
-            stored = self.vector_store.get(limit=1, include=["metadatas"])
-            metadata = (stored.get("metadatas") or [{}])[0]
+    def ensure_index_current(self) -> int:
+        chunk_count = self.chunk_count
+        if chunk_count:
+            stored = self.vector_store.get(include=["metadatas"])
+            metadatas = stored.get("metadatas") or []
             required_fields = {
                 "parent_id",
                 "policy_type",
@@ -58,9 +60,22 @@ class KnowledgeBase:
                 "effective_date",
                 "payment_method",
             }
-            if required_fields.issubset(metadata) and self.parent_store.count:
-                return self.chunk_count
-            logger.info("Refreshing indexed documents to add hybrid-search metadata")
+            metadata_is_current = (
+                len(metadatas) == chunk_count
+                and all(required_fields.issubset(metadata or {}) for metadata in metadatas)
+            )
+            parent_ids = list(dict.fromkeys(
+                str(metadata["parent_id"])
+                for metadata in metadatas
+                if metadata and metadata.get("parent_id")
+            ))
+            parents_are_current = (
+                bool(parent_ids)
+                and len(self.parent_store.get_many(parent_ids)) == len(parent_ids)
+            )
+            if metadata_is_current and parents_are_current:
+                return chunk_count
+            logger.info("Refreshing incomplete policy index")
         return self.index_directory()
 
     def index_directory(self) -> int:

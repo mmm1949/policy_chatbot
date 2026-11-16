@@ -1,3 +1,4 @@
+import math
 import re
 from threading import Lock
 from typing import Mapping
@@ -13,8 +14,8 @@ def cosine_distance_to_similarity(distance: float) -> float:
     return max(0.0, min(1.0, 1.0 - distance))
 
 
-def infer_metadata_filters(query: str) -> dict[str, str]:
-    filters: dict[str, str] = {}
+def infer_metadata_hints(query: str) -> dict[str, str]:
+    hints: dict[str, str] = {}
     region_patterns = {
         "India": r"\bIndia\b",
         "United States": r"\b(?:United States|USA|U\.S\.)\b",
@@ -28,7 +29,7 @@ def infer_metadata_filters(query: str) -> dict[str, str]:
         if re.search(pattern, query, re.IGNORECASE)
     ]
     if len(regions) == 1:
-        filters["region"] = regions[0]
+        hints["region"] = regions[0]
 
     sample = query.casefold()
     policy_terms = (
@@ -44,63 +45,43 @@ def infer_metadata_filters(query: str) -> dict[str, str]:
         if any(term in sample for term in terms)
     ]
     if len(matching_types) == 1:
-        filters["policy_type"] = matching_types[0]
+        hints["policy_type"] = matching_types[0]
 
     if re.search(r"\b(?:card|cards|credit card|debit card|card payment)\b", query, re.I):
-        filters["payment_method"] = "card"
+        hints["payment_method"] = "card"
     elif re.search(r"\bUPI\b", query, re.I):
-        filters["payment_method"] = "UPI"
+        hints["payment_method"] = "UPI"
     elif re.search(r"\b(?:bank transfer|ACH|wire transfer)\b", query, re.I):
-        filters["payment_method"] = "bank_transfer"
+        hints["payment_method"] = "bank_transfer"
 
     version = re.search(r"\bversion\s*[:#]?\s*([0-9]+(?:\.[0-9]+)*)\b", query, re.I)
     if version:
-        filters["document_version"] = version.group(1)
+        hints["document_version"] = version.group(1)
     effective_date = re.search(
         r"\beffective\s+(?:date|from|on|as of)\s*[:\-]?\s*(\d{4}-\d{2}-\d{2})\b",
         query,
         re.I,
     )
     if effective_date:
-        filters["effective_date"] = effective_date.group(1)
-    return filters
+        hints["effective_date"] = effective_date.group(1)
+    return hints
 
 
 def _tokenize(text: str) -> list[str]:
     return re.findall(r"[\w]+(?:[.+/-][\w]+)*", text.casefold())
 
 
-def _where_filter(filters: Mapping[str, str]) -> dict | None:
-    fallbacks = {
-        "region": ("global", "unspecified"),
-        "policy_type": ("general", "unspecified"),
-        "payment_method": ("unspecified",),
-        "document_version": ("unspecified",),
-        "effective_date": ("unspecified",),
-    }
-    conditions = []
-    for field, value in filters.items():
-        choices = (value, *fallbacks.get(field, ("unspecified",)))
-        conditions.append(
-            {"$or": [{field: choice} for choice in dict.fromkeys(choices)]}
-        )
-    if not conditions:
-        return None
-    return conditions[0] if len(conditions) == 1 else {"$and": conditions}
-
-
-def _matches_filters(metadata: Mapping[str, object], filters: Mapping[str, str]) -> bool:
-    fallbacks = {
-        "region": {"global", "unspecified"},
-        "policy_type": {"general", "unspecified"},
-        "payment_method": {"unspecified"},
-        "document_version": {"unspecified"},
-        "effective_date": {"unspecified"},
-    }
-    return all(
-        str(metadata.get(field, "unspecified")) in {value, *fallbacks.get(field, {"unspecified"})}
-        for field, value in filters.items()
+def _metadata_match_ratio(
+    metadata: Mapping[str, object],
+    hints: Mapping[str, str],
+) -> float:
+    if not hints:
+        return 0.0
+    matches = sum(
+        str(metadata.get(field, "")).casefold() == value.casefold()
+        for field, value in hints.items()
     )
+    return matches / len(hints)
 
 
 class VectorRetriever:
@@ -113,9 +94,12 @@ class VectorRetriever:
         reranker_device: str = "auto",
         rrf_constant: int = 60,
         parent_store: ParentDocumentStore | None = None,
+        relevance_threshold: float | None = None,
     ) -> None:
         if candidate_k < 1 or reranker_top_k < 1 or rrf_constant < 1:
             raise ValueError("Retrieval candidate, result, and RRF limits must be positive.")
+        if relevance_threshold is not None and not math.isfinite(relevance_threshold):
+            raise ValueError("The relevance threshold must be a finite reranker score.")
         self.vector_store = vector_store
         self.candidate_k = candidate_k
         self.reranker_top_k = reranker_top_k
@@ -123,6 +107,8 @@ class VectorRetriever:
         self.reranker_device = reranker_device
         self.rrf_constant = rrf_constant
         self.parent_store = parent_store
+        self.relevance_threshold = relevance_threshold
+        self.metadata_boost_weight = 0.25
         self._corpus: list[tuple[str, Document]] | None = None
         self._corpus_tokens: list[list[str]] = []
         self._bm25: BM25Okapi | None = None
@@ -131,17 +117,16 @@ class VectorRetriever:
         self._reranker_lock = Lock()
 
     def search(
-        self, query: str, filters: Mapping[str, str] | None = None
+        self, query: str, metadata_hints: Mapping[str, str] | None = None
     ) -> list[tuple[Document, float]]:
-        filters = filters or {}
+        metadata_hints = metadata_hints or {}
         if self.vector_store._collection.count() == 0:
             return []
 
-        where = _where_filter(filters)
         vector_results = self.vector_store.similarity_search_with_score(
             query,
             k=self.candidate_k,
-            filter=where,
+            filter=None,
         )
         candidates: dict[str, tuple[Document, float]] = {}
         fused_scores: dict[str, float] = {}
@@ -152,11 +137,18 @@ class VectorRetriever:
                 self.rrf_constant + rank
             )
 
-        bm25_scores = self._bm25_scores(query, filters)
+        bm25_scores = self._bm25_scores(query)
         for rank, (key, document, _) in enumerate(bm25_scores, start=1):
             candidates[key] = (document, 0.0)
             fused_scores[key] = fused_scores.get(key, 0.0) + 1 / (
                 self.rrf_constant + rank
+            )
+
+        for key, (document, _) in candidates.items():
+            fused_scores[key] += (
+                self.metadata_boost_weight
+                * _metadata_match_ratio(document.metadata, metadata_hints)
+                / (self.rrf_constant + 1)
             )
 
         fused = sorted(
@@ -192,14 +184,35 @@ class VectorRetriever:
                 if parent:
                     ranked[result_id] = (parent, score)
 
-        return sorted(
+        by_reranker = sorted(
             ranked.values(),
             key=lambda item: item[1],
             reverse=True,
-        )[:self.reranker_top_k]
+        )
+        ranked_results = [
+            (
+                document,
+                score,
+                1 / (self.rrf_constant + rank)
+                + self.metadata_boost_weight
+                * _metadata_match_ratio(document.metadata, metadata_hints)
+                / (self.rrf_constant + 1),
+            )
+            for rank, (document, score) in enumerate(by_reranker, start=1)
+        ]
+        if self.relevance_threshold is not None:
+            ranked_results = [
+                item for item in ranked_results
+                if item[1] >= self.relevance_threshold
+            ]
+        ranked_results.sort(key=lambda item: item[2], reverse=True)
+        return [
+            (document, score)
+            for document, score, _ in ranked_results[:self.reranker_top_k]
+        ]
 
     def _bm25_scores(
-        self, query: str, filters: Mapping[str, str]
+        self, query: str
     ) -> list[tuple[str, Document, float]]:
         self._load_bm25()
         if not self._corpus or not self._bm25:
@@ -212,7 +225,6 @@ class VectorRetriever:
             (self._corpus[index][0], self._corpus[index][1], float(score))
             for index, score in enumerate(scores)
             if any(token in self._corpus_tokens[index] for token in query_tokens)
-            and _matches_filters(self._corpus[index][1].metadata, filters)
         ]
         return sorted(matching, key=lambda item: item[2], reverse=True)[
             :self.candidate_k

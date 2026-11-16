@@ -15,7 +15,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
-    confidence: float = Field(ge=0, le=1)
+    reranker_score: float
     sources: list[SourceReference] = Field(default_factory=list)
     conversation_id: str
 

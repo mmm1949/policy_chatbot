@@ -7,6 +7,8 @@ import streamlit as st
 
 
 API_URL = os.getenv("POLICY_API_URL", "http://localhost:8000").rstrip("/")
+API_TOKEN = os.getenv("POLICY_API_TOKEN", "")
+API_HEADERS = {"Authorization": f"Bearer {API_TOKEN}"} if API_TOKEN else {}
 st.set_page_config(page_title="Toucan Merchant Assistant", layout="wide")
 
 SAMPLE_QUESTIONS = [
@@ -280,7 +282,7 @@ st.markdown(
         letter-spacing: 0.02em;
     }
 
-    /* Sources and confidence chips */
+    /* Sources and reranker-score chips */
     .meta-row {
         display: flex;
         flex-wrap: wrap;
@@ -311,7 +313,7 @@ st.markdown(
         font-weight: 600;
     }
 
-    .conf-chip {
+    .score-chip {
         display: inline-flex;
         align-items: center;
         margin-left: auto;
@@ -407,7 +409,7 @@ st.markdown(
             max-width: 92%;
         }
 
-        .conf-chip {
+        .score-chip {
             margin-left: 0;
         }
     }
@@ -447,10 +449,10 @@ def _meta_html(message: dict) -> str:
                 f", page {source['page']}" if source.get("page") else ""
             )
             chips.append(f'<span class="src-chip">{html.escape(label)}</span>')
-    confidence = message.get("confidence")
-    if confidence is not None:
+    reranker_score = message.get("reranker_score")
+    if reranker_score is not None:
         chips.append(
-            f'<span class="conf-chip">Confidence {float(confidence):.0%}</span>'
+            f'<span class="score-chip">Reranker score {float(reranker_score):.3f}</span>'
         )
     if not chips:
         return ""
@@ -493,6 +495,7 @@ if not st.session_state.history_loaded:
     try:
         history_response = requests.get(
             f"{API_URL}/conversations/{st.session_state.conversation_id}",
+            headers=API_HEADERS,
             timeout=10,
         )
         history_response.raise_for_status()
@@ -549,6 +552,7 @@ if question:
                     "question": question,
                     "conversation_id": st.session_state.conversation_id,
                 },
+                headers=API_HEADERS,
                 timeout=90,
             )
             response.raise_for_status()
@@ -557,7 +561,7 @@ if question:
             "role": "assistant",
             "content": answer["answer"],
             "sources": answer["sources"],
-            "confidence": answer["confidence"],
+            "reranker_score": answer["reranker_score"],
         }
         st.session_state.messages.append(assistant_message)
         st.session_state.conversation_id = answer["conversation_id"]

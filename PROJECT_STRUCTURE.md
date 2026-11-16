@@ -11,7 +11,7 @@ the application runs.
 ```text
 policy_chatbot/
 ├── client/
-│   ├── streamlit_app.py
+│   ├── app.py
 │   ├── requirements.txt
 │   ├── Dockerfile
 │   └── .dockerignore
@@ -50,6 +50,8 @@ policy_chatbot/
 │   ├── Dockerfile
 │   ├── .dockerignore
 ├── tests/
+│   ├── test_api_auth.py
+│   ├── test_hybrid_retrieval.py
 │   └── test_rag_graph.py
 ├── .env.example
 ├── .gitignore
@@ -69,7 +71,7 @@ currently contain no application functions.
 
 ```mermaid
 flowchart LR
-    B[Browser] --> UI[client/streamlit_app.py]
+    B[Browser] --> UI[client/app.py]
     UI -->|HTTP JSON| API[server/api/main.py]
     API --> SCHEMA[server/models/schemas.py]
     API --> GRAPH[server/services/rag.py]
@@ -88,14 +90,15 @@ flowchart LR
 3. FastAPI validates the request and calls `RAGService.answer()`.
 4. The LangGraph workflow recalls recent and relevant older messages from
    SQLite, then classifies the message. A follow-up is rewritten using that
-   conversation context. A policy question gets metadata-filtered BM25 and
-   Chroma retrieval, RRF fusion, and cross-encoder reranking.
+   conversation context. A policy question gets broad BM25 and Chroma
+   retrieval, with metadata hints used as a soft ranking boost before
+   cross-encoder reranking.
 5. If the first search is insufficient, the graph can run one refinement pass
    with up to two additional queries. A direct evidence check and grounding
    check gate policy answers.
 6. The graph stores the exchange in bounded SQLite memory and returns the
-   answer, confidence, sources, and conversation ID.
-7. Streamlit renders the answer and its citation/confidence details.
+   answer, reranker score, cited sources, and conversation ID.
+7. Streamlit renders the answer and its citation/reranker-score details.
 
 ## 3. Root-level files
 
@@ -105,7 +108,7 @@ flowchart LR
 | [`BACKEND_ARCHITECTURE.md`](./BACKEND_ARCHITECTURE.md) | Detailed backend workflow and design, especially the LangGraph steps, API, memory, and retrieval. |
 | [`PROJECT_STRUCTURE.md`](./PROJECT_STRUCTURE.md) | This file: folder and file map, function guide, and connections. |
 | [`docker-compose.yml`](./docker-compose.yml) | Starts the FastAPI server and Streamlit client; configures networking, ports, persistent Chroma and memory volumes, and the source-document mount. |
-| [`.env.example`](./.env.example) | Safe configuration template containing Groq, model, storage, chunking, retrieval, and CORS setting names and defaults. Copy it to `.env` and set your own key. |
+| [`.env.example`](./.env.example) | Safe configuration template containing Groq, API-token, model, storage, chunking, retrieval, and CORS settings. Copy it to `.env` and replace secret placeholders. |
 | [`.gitignore`](./.gitignore) | Keeps local secrets, Python environments/caches, Chroma output, and local policy documents out of source control. |
 
 ## 4. `client/` — Streamlit user interface
@@ -113,7 +116,7 @@ flowchart LR
 The client is a separate process from the API. It calls the server over HTTP;
 it does not import backend Python services.
 
-### `client/streamlit_app.py`
+### `client/app.py`
 
 Creates the chat screen, requests server endpoints, restores conversation
 history, and displays assistant answers and citations.
@@ -124,11 +127,11 @@ Main functions:
   the HTTP client's error text.
 - `_render_message(message, message_index)` — Renders one user or assistant
   message. Assistant messages use Markdown; user messages use plain text.
-  Displays sources and confidence when included.
+  Displays cited sources and the reranker score when included.
 
 Other top-level behavior:
 
-- Reads `POLICY_API_URL` (defaults to `http://localhost:8000`).
+- Reads `POLICY_API_URL` and `POLICY_API_TOKEN`.
 - Configures Streamlit and injects the page styling, navbar, and hero section.
 - Initializes `st.session_state` values for messages, conversation ID, and
   history loading.
@@ -187,7 +190,8 @@ responses; they do not perform retrieval or generate answers.
 - `SourceReference` — Source document name and optional page number.
 - `ChatRequest` — User question plus optional conversation ID, with length
   validation.
-- `ChatResponse` — Answer, confidence score, source list, and conversation ID.
+- `ChatResponse` — Answer, raw reranker score, cited source list, and
+  conversation ID.
 - `ConversationMessage` — A `user` or `assistant` role and its message content.
 - `ConversationHistory` — Conversation ID and messages returned by the history
   endpoint.
@@ -208,7 +212,7 @@ Types:
 
 - `SourceReference` — Typed source dictionary with document and optional page.
 - `RAGState` — Typed graph state: question, history, queries, retrieved
-  documents, confidence, decisions, answer, and sources.
+  documents, reranker score, decisions, answer, and cited sources.
 - `RAGResult` — Typed service result consumed by the API.
 
 `RAGService` methods:
@@ -231,7 +235,7 @@ Types:
   fallback, retrieval, or follow-up rewriting.
 - `_rewrite_query(state)` — Converts a contextual follow-up into a standalone
   retrieval query without treating history as policy evidence.
-- `_retrieve(state)` — Infers metadata filters, runs hybrid search for active
+- `_retrieve(state)` — Infers metadata hints, runs broad hybrid search for active
   queries, merges duplicate parent sources, and records reranker scores.
 - `_route_generation(state)` — Chooses grounding verification, one retrieval
   refinement, or the no-answer path.
@@ -239,7 +243,7 @@ Types:
   empty retrieval or failed grounding and increments the bounded retrieval-pass
   counter.
 - `_generate_answer(state)` — Drafts a response from retrieved excerpts and
-  builds the distinct source/page list.
+  builds the distinct source/page list from citations in the answer.
 - `_verify_grounding(state)` — Rejects answers whose citations do not match
   retrieved sources, then asks the model to verify evidence support.
 - `_citations_match_sources(answer, sources)` — Normalizes common full-width
@@ -248,7 +252,7 @@ Types:
 - `_route_grounding(state)` — Sends grounded responses to memory; gives an
   ungrounded first-pass answer one retrieval refinement before fallback.
 - `_set_no_answer(state)` — Sets the fixed safe no-answer message and clears
-  confidence and citations.
+  the reranker score and citations.
 - `_social_response(state)` — Handles greetings without supplying policy
   excerpts or factual model knowledge.
 - `_remember(state)` — Stores the exchange once after the selected graph path.
@@ -295,8 +299,8 @@ Also exposes inspection data used by the document API routes.
   the local Hugging Face embedding model, opens the Chroma collection, and
   creates a hybrid `VectorRetriever` and SQLite parent store.
 - `chunk_count` — Property returning the indexed chunk count.
-- `index_if_empty()` — Indexes configured documents when the collection is empty
-  or lacks current hybrid-search metadata.
+- `ensure_index_current()` — Reuses a complete collection or indexes configured
+  documents when chunks or parent references are missing or stale.
 - `index_directory()` — Loads supported files recursively, creates parent
   sections/tables and child chunks, sanitizes metadata, calculates stable IDs,
   writes current chunks and parent records, and deletes obsolete IDs.
@@ -347,11 +351,12 @@ and indexed by command or on empty-database startup.
 
 #### `server/retrieval/vector.py`
 
-- `infer_metadata_filters(query)` — Detects supported region, policy type,
-  payment method, version, and effective-date filters from a query.
-- `VectorRetriever.search(query, filters)` — Retrieves metadata-filtered
-  candidates with BM25 and Chroma, fuses ranks with RRF, reranks candidates,
-  and returns matching parent documents.
+- `infer_metadata_hints(query)` — Detects region, policy type, payment method,
+  version, and effective-date hints from a query.
+- `VectorRetriever.search(query, metadata_hints)` — Retrieves broad candidates
+  with BM25 and Chroma, gives metadata matches a soft boost, fuses ranks with
+  RRF, applies cross-encoder reranking and an optional score threshold, then
+  returns matching parent documents.
 - `VectorRetriever._get_reranker()` — Lazily loads the configured local
   Sentence Transformers cross-encoder.
 
@@ -365,7 +370,8 @@ and indexed by command or on empty-database startup.
 ### Other backend files
 
 - `server/config.py`
-  - `Settings` — Declares environment-backed settings, defaults, and paths.
+  - `Settings` — Declares environment-backed settings, defaults, paths,
+    `API_AUTH_TOKEN`, and the optional `RELEVANCE_THRESHOLD`.
   - `Settings.resolve_data_path(value)` — Resolves relative document, Chroma,
     and conversation memory paths from the project root.
   - `Settings.allowed_origins` — Returns parsed CORS origins.
@@ -414,10 +420,11 @@ source and should not be edited as part of normal feature work.
 
 ## 7. `tests/` — automated checks
 
-### `tests/test_rag_graph.py`
+### `tests/test_rag_graph.py` and `tests/test_api_auth.py`
 
 Uses fake model and retriever objects so workflow paths can be tested without
-Groq network calls or a live Chroma database.
+Groq network calls or a live Chroma database. The RAG tests use temporary
+SQLite paths rather than the persistent local memory database.
 
 - `FakeModel` — Returns deterministic classifier, rewrite, answer, and
   grounding responses based on the prompt.
@@ -439,6 +446,8 @@ Groq network calls or a live Chroma database.
   fabricated document/page citations are rejected.
 - `test_answer_with_unicode_citation_format_is_accepted()` — Covers normalized
   full-width citation brackets and narrow whitespace.
+- `test_sources_only_include_passages_cited_in_the_answer()` — Ensures
+  uncited retrieved passages are omitted from the response source list.
 - `test_follow_up_rewrite_uses_only_its_conversation_history()` — Checks
   follow-up rewrite and isolation between conversation IDs.
 - `test_out_of_scope_message_uses_safe_fallback_without_retrieval()` — Ensures
@@ -456,6 +465,10 @@ $env:PYTHONPATH = "server"
 python -m pytest tests
 ```
 
+`tests/test_api_auth.py` covers missing, invalid, and valid bearer tokens. The
+hybrid retrieval tests cover stale-index repair, soft metadata ranking, missing
+metadata, and optional reranker-score thresholds.
+
 ## 8. Relationships between the major files
 
 ### Indexing flow
@@ -470,13 +483,14 @@ ingestion/index_documents.py
 ```
 
 The same `KnowledgeBase` is also initialized by the FastAPI lifespan handler.
-On API startup it indexes the policy directory only if the Chroma collection is
-empty; manual reindexing uses the command above.
+On every API startup it validates the collection and rebuilds it if chunk
+metadata or parent references are incomplete; manual reindexing uses the
+command above.
 
 ### Chat flow
 
 ```text
-client/streamlit_app.py
+client/app.py
     → server/api/main.py
         → server/models/schemas.py
         → server/services/rag.py: RAGService.answer()
@@ -492,14 +506,14 @@ client/streamlit_app.py
 .env.example → developer's private .env → server/config.py
 docker-compose.yml → server/Dockerfile + client/Dockerfile
                  → persistent Chroma volume + documents mount
-                 → POLICY_API_URL links Streamlit to FastAPI
+                 → POLICY_API_URL and POLICY_API_TOKEN configure Streamlit access
 ```
 
 ## 9. Where to make common changes
 
 | If you want to... | Start here |
 |---|---|
-| Change the chat UI, colors, layout, or message display | `client/streamlit_app.py` |
+| Change the chat UI, colors, layout, or message display | `client/app.py` |
 | Change the `/chat` request/response shape | `server/models/schemas.py`, then `server/api/main.py` |
 | Change graph steps, prompts, answer grounding, or retrieval refinement | `server/services/rag.py` |
 | Change conversation retention limits | `server/services/memory.py` |
